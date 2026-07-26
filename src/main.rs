@@ -2251,7 +2251,13 @@ enum Action {
 #[derive(Clone, Copy, PartialEq)]
 enum PaletteMode {
     Commands,
-    SearchCurrentFolder,
+    Search(SearchScope),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SearchScope {
+    CurrentFolder,
+    Recursive,
 }
 
 /// An open right-click context menu: where it sits, and the entry it targets
@@ -2589,6 +2595,10 @@ struct Shuffle {
     palette_scroll: ScrollHandle,
     /// In-memory fuzzy index of ~/ (None until the background build finishes).
     index: Option<Arc<FileIndex>>,
+    /// Lazily-built recursive index for one explicitly searched directory.
+    recursive_index: Option<(PathBuf, Arc<FileIndex>)>,
+    /// Directory currently being indexed for recursive search.
+    recursive_index_loading: Option<PathBuf>,
     context_menu: Option<ContextMenu>,
     /// In-progress inline rename, if any.
     rename: Option<Rename>,
@@ -2810,6 +2820,8 @@ impl Shuffle {
             search_gen: 0,
             palette_scroll: ScrollHandle::new(),
             index: None,
+            recursive_index: None,
+            recursive_index_loading: None,
             context_menu: None,
             rename: None,
             sort_menu: None,
@@ -4814,11 +4826,63 @@ impl Shuffle {
     }
 
     fn toggle_current_folder_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette_open && self.palette_mode == PaletteMode::SearchCurrentFolder {
+        if self.palette_open
+            && matches!(
+                self.palette_mode,
+                PaletteMode::Search(SearchScope::CurrentFolder)
+            )
+        {
             self.close_palette(cx);
         } else {
-            self.open_palette(PaletteMode::SearchCurrentFolder, window, cx);
+            self.open_palette(
+                PaletteMode::Search(SearchScope::CurrentFolder),
+                window,
+                cx,
+            );
         }
+    }
+
+    fn set_search_scope(&mut self, scope: SearchScope, cx: &mut Context<Self>) {
+        self.palette_mode = PaletteMode::Search(scope);
+        if scope == SearchScope::Recursive {
+            self.ensure_recursive_index(cx);
+        }
+        self.refresh_palette(cx);
+    }
+
+    fn ensure_recursive_index(&mut self, cx: &mut Context<Self>) {
+        let root = self.active_tab().current_dir.clone();
+        if self
+            .recursive_index
+            .as_ref()
+            .is_some_and(|(indexed_root, _)| indexed_root == &root)
+            || self.recursive_index_loading.as_ref() == Some(&root)
+        {
+            return;
+        }
+
+        self.recursive_index_loading = Some(root.clone());
+        cx.spawn(async move |this, cx| {
+            let build_root = root.clone();
+            let index = cx
+                .background_spawn(async move { FileIndex::build(build_root) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.recursive_index_loading.as_ref() != Some(&root) {
+                    return;
+                }
+                this.recursive_index_loading = None;
+                this.recursive_index = Some((root.clone(), Arc::new(index)));
+                if this.palette_open
+                    && this.palette_mode == PaletteMode::Search(SearchScope::Recursive)
+                    && this.active_tab().current_dir == root
+                {
+                    this.refresh_palette(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn close_palette(&mut self, cx: &mut Context<Self>) {
@@ -4847,7 +4911,7 @@ impl Shuffle {
         self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
         let q = self.query.trim().to_string();
 
-        if self.palette_mode == PaletteMode::SearchCurrentFolder {
+        if self.palette_mode == PaletteMode::Search(SearchScope::CurrentFolder) {
             if q.is_empty() {
                 self.palette_items.clear();
                 cx.notify();
@@ -4885,6 +4949,71 @@ impl Shuffle {
                 })
                 .collect();
             cx.notify();
+            return;
+        }
+
+        if self.palette_mode == PaletteMode::Search(SearchScope::Recursive) {
+            let root = self.active_tab().current_dir.clone();
+            let index = self.recursive_index.as_ref().and_then(|(indexed_root, index)| {
+                (indexed_root == &root).then(|| index.clone())
+            });
+            let Some(index) = index else {
+                self.palette_items = vec![PaletteItem {
+                    title: "Indexing current folder…".to_string(),
+                    subtitle: root.to_string_lossy().into_owned(),
+                    action: Action::None,
+                    is_dir: false,
+                }];
+                cx.notify();
+                return;
+            };
+            if q.is_empty() {
+                self.palette_items.clear();
+                cx.notify();
+                return;
+            }
+
+            self.palette_items.clear();
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                let current = this.update(cx, |this, _| {
+                    this.search_gen == gen
+                        && this.palette_mode
+                            == PaletteMode::Search(SearchScope::Recursive)
+                        && this.active_tab().current_dir == root
+                });
+                if !matches!(current, Ok(true)) {
+                    return;
+                }
+                let hits = cx
+                    .background_spawn(async move { index.search(&q, 50) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.search_gen != gen
+                        || this.palette_mode
+                            != PaletteMode::Search(SearchScope::Recursive)
+                        || this.active_tab().current_dir != root
+                    {
+                        return;
+                    }
+                    this.palette_items = hits
+                        .into_iter()
+                        .map(|(name, path, is_dir)| PaletteItem {
+                            title: name,
+                            subtitle: path.to_string_lossy().into_owned(),
+                            action: Action::Open(path, is_dir),
+                            is_dir,
+                        })
+                        .collect();
+                    this.selected = 0;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
             return;
         }
 
@@ -5347,7 +5476,7 @@ impl Shuffle {
             self.refresh_palette(cx);
             return;
         }
-        if prefs().palette_history {
+        if self.palette_mode == PaletteMode::Commands && prefs().palette_history {
             if km.get(KeyAction::PaletteHistoryPrev) == Some(kc.as_str()) {
                 self.palette_history_prev(cx);
                 return;
@@ -5586,7 +5715,7 @@ impl Shuffle {
 
     /// Record a submitted query into the palette history (when enabled).
     fn record_palette_history(&mut self) {
-        if !prefs().palette_history {
+        if self.palette_mode != PaletteMode::Commands || !prefs().palette_history {
             return;
         }
         let q = self.query.trim().to_string();
@@ -5668,7 +5797,12 @@ impl Shuffle {
         // a highlighted span between the unselected head and tail.
         let placeholder = match self.palette_mode {
             PaletteMode::Commands => "Type a path, or a file/folder name…",
-            PaletteMode::SearchCurrentFolder => "Search the current folder…",
+            PaletteMode::Search(SearchScope::CurrentFolder) => {
+                "Search direct children of the current folder…"
+            }
+            PaletteMode::Search(SearchScope::Recursive) => {
+                "Search the current folder recursively…"
+            }
         };
         let input = if self.query.is_empty() {
             div()
@@ -5695,6 +5829,51 @@ impl Shuffle {
             div()
                 .text_color(rgb(t.text))
                 .child(format!("{before}\u{2502}{after}"))
+        };
+
+        let scope_switcher: AnyElement = match self.palette_mode {
+            PaletteMode::Commands => gpui::Empty.into_any_element(),
+            PaletteMode::Search(scope) => {
+                let scope_button = |
+                    id: &'static str,
+                    label: &'static str,
+                    target: SearchScope,
+                | {
+                    let active = scope == target;
+                    div()
+                        .id(id)
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_xs()
+                        .text_color(rgb(if active { t.text } else { t.text_muted }))
+                        .when(active, |s| s.bg(rgb(t.selected)))
+                        .when(!active, |s| s.hover(|s| s.bg(rgb(t.hover))))
+                        .child(label)
+                        .on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.set_search_scope(target, cx);
+                            },
+                        ))
+                };
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(scope_button(
+                        "search-current-folder",
+                        "Current folder",
+                        SearchScope::CurrentFolder,
+                    ))
+                    .child(scope_button(
+                        "search-recursive",
+                        "Recursive",
+                        SearchScope::Recursive,
+                    ))
+                    .into_any_element()
+            }
         };
 
         // What Enter would do to the current selection (footer hint).
@@ -5736,7 +5915,8 @@ impl Shuffle {
                                 "🔍"
                             }),
                     )
-                    .child(input),
+                    .child(div().flex_1().min_w_0().child(input))
+                    .child(scope_switcher),
             )
             // Scrollable, height-capped results with a scroll indicator.
             .child(
