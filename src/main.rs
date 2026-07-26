@@ -2598,6 +2598,9 @@ struct Shuffle {
     /// the drag position on every synthesized drag-move — one source of truth,
     /// so the highlight can't flicker between panes.
     drop_hover: Option<(usize, Option<usize>)>,
+    /// Transient operation result: (generation, message, is_error).
+    notice: Option<(u64, String, bool)>,
+    notice_gen: u64,
 }
 
 /// Update-check state shared between the Settings window (which drives the
@@ -2798,6 +2801,8 @@ impl Shuffle {
             update: None,
             hovered: None,
             drop_hover: None,
+            notice: None,
+            notice_gen: 0,
         }
     }
 
@@ -2829,6 +2834,80 @@ impl Shuffle {
             self.finder_favorites = favorites;
             cx.notify();
         }
+    }
+
+    fn show_notice(&mut self, message: String, is_error: bool, cx: &mut Context<Self>) {
+        self.notice_gen += 1;
+        let generation = self.notice_gen;
+        self.notice = Some((generation, message, is_error));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(4))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .notice
+                    .as_ref()
+                    .is_some_and(|(current, _, _)| *current == generation)
+                {
+                    this.notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn show_operation_error(
+        &mut self,
+        action: &str,
+        path: &Path,
+        error: &std::io::Error,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_notice(
+            format!("{action} failed for “{}”: {error}", path_label(path)),
+            true,
+            cx,
+        );
+    }
+
+    fn render_notice(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let (_, message, is_error) = self.notice.as_ref()?;
+        let border = if *is_error { 0xef4444 } else { theme().accent };
+        Some(
+            div()
+                .absolute()
+                .top(px(TITLEBAR_H + 12.0))
+                .right(px(16.0))
+                .max_w(px(460.0))
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .bg(rgb(theme().surface))
+                .border_1()
+                .border_color(rgb(border))
+                .shadow_lg()
+                .text_color(rgb(theme().text))
+                .child(div().flex_1().child(message.clone()))
+                .child(
+                    div()
+                        .id("dismiss-operation-notice")
+                        .cursor_pointer()
+                        .text_color(rgb(theme().text_muted))
+                        .hover(|s| s.text_color(rgb(theme().text)))
+                        .child("×")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.notice = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     // ----- right-click context menu -----
@@ -2939,17 +3018,23 @@ impl Shuffle {
 
     fn new_folder(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
         let path = unique_child(&self.tab(pane).current_dir, "untitled folder");
-        if fs::create_dir(&path).is_ok() {
-            self.refresh_pane(pane, cx);
-            self.reveal_and_rename(pane, path, window, cx);
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                self.refresh_pane(pane, cx);
+                self.reveal_and_rename(pane, path, window, cx);
+            }
+            Err(error) => self.show_operation_error("Create folder", &path, &error, cx),
         }
     }
 
     fn new_file(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
         let path = unique_child(&self.tab(pane).current_dir, "untitled file");
-        if fs::File::create(&path).is_ok() {
-            self.refresh_pane(pane, cx);
-            self.reveal_and_rename(pane, path, window, cx);
+        match fs::File::create(&path) {
+            Ok(_) => {
+                self.refresh_pane(pane, cx);
+                self.reveal_and_rename(pane, path, window, cx);
+            }
+            Err(error) => self.show_operation_error("Create file", &path, &error, cx),
         }
     }
 
@@ -3003,6 +3088,13 @@ impl Shuffle {
     fn move_to_trash(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
         if trash_path(&path) {
             self.refresh_pane(pane, cx);
+            self.show_notice(format!("Moved “{}” to Trash", path_label(&path)), false, cx);
+        } else {
+            self.show_notice(
+                format!("Couldn’t move “{}” to Trash", path_label(&path)),
+                true,
+                cx,
+            );
         }
     }
 
@@ -3025,13 +3117,33 @@ impl Shuffle {
     /// Carry out a confirmed delete: move every path to Trash.
     fn perform_delete(&mut self, cx: &mut Context<Self>) {
         if let Some((pane, paths)) = self.confirm_delete.take() {
+            let mut failed = Vec::new();
             for p in &paths {
-                trash_path(p);
+                if !trash_path(p) {
+                    failed.push(path_label(p));
+                }
             }
             let tab = self.tab_mut(pane);
             tab.selection.clear();
             tab.anchor = None;
             self.refresh_pane(pane, cx);
+            if failed.is_empty() {
+                self.show_notice(
+                    format!(
+                        "Moved {} item{} to Trash",
+                        paths.len(),
+                        if paths.len() == 1 { "" } else { "s" }
+                    ),
+                    false,
+                    cx,
+                );
+            } else {
+                self.show_notice(
+                    format!("Couldn’t move to Trash: {}", failed.join(", ")),
+                    true,
+                    cx,
+                );
+            }
         }
         cx.notify();
     }
@@ -3048,6 +3160,11 @@ impl Shuffle {
     /// if it's already there; refuses to overwrite an existing item.
     fn move_into(&mut self, dest_dir: PathBuf, src: PathBuf, cx: &mut Context<Self>) {
         if !dest_dir.is_dir() {
+            self.show_notice(
+                format!("Destination is unavailable: {}", display_path(&dest_dir)),
+                true,
+                cx,
+            );
             return;
         }
         let Some(name) = src.file_name() else { return };
@@ -3060,11 +3177,26 @@ impl Shuffle {
         }
         let dest = dest_dir.join(name);
         if dest.exists() {
-            return; // don't clobber existing files
+            self.show_notice(
+                format!("“{}” already exists in this folder", path_label(&dest)),
+                true,
+                cx,
+            );
+            return;
         }
         // `mv` handles cross-volume moves (copy + delete) too.
-        let _ = Command::new("mv").arg(&src).arg(&dest).status();
-        self.refresh_all_panes(cx);
+        match Command::new("mv").arg(&src).arg(&dest).status() {
+            Ok(status) if status.success() => {
+                self.refresh_all_panes(cx);
+                self.show_notice(format!("Moved “{}”", path_label(&dest)), false, cx);
+            }
+            Ok(status) => self.show_notice(
+                format!("Move failed with status {status}"),
+                true,
+                cx,
+            ),
+            Err(error) => self.show_operation_error("Move", &src, &error, cx),
+        }
     }
 
     // ----- inline rename -----
@@ -3140,18 +3272,22 @@ impl Shuffle {
                         .path
                         .file_name()
                         .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(new));
-                    if dest != r.path
-                        && (case_only || !dest.exists())
-                        && fs::rename(&r.path, &dest).is_ok()
-                    {
-                        let tab = self.tab_mut(r.pane);
-                        if tab.selection.remove(&r.path) {
-                            tab.selection.insert(dest.clone());
+                    if dest != r.path && (case_only || !dest.exists()) {
+                        match fs::rename(&r.path, &dest) {
+                            Ok(()) => {
+                                let tab = self.tab_mut(r.pane);
+                                if tab.selection.remove(&r.path) {
+                                    tab.selection.insert(dest.clone());
+                                }
+                                if tab.anchor.as_deref() == Some(r.path.as_path()) {
+                                    tab.anchor = Some(dest);
+                                }
+                                self.refresh_pane(r.pane, cx);
+                            }
+                            Err(error) => {
+                                self.show_operation_error("Rename", &r.path, &error, cx)
+                            }
                         }
-                        if tab.anchor.as_deref() == Some(r.path.as_path()) {
-                            tab.anchor = Some(dest);
-                        }
-                        self.refresh_pane(r.pane, cx);
                     }
                 }
             }
@@ -3362,8 +3498,18 @@ impl Shuffle {
             None => format!("{stem} copy"),
         };
         let dest = unique_child(parent, &base);
-        let _ = Command::new("cp").arg("-R").arg(&path).arg(&dest).status();
-        self.refresh_pane(pane, cx);
+        match Command::new("cp").arg("-R").arg(&path).arg(&dest).status() {
+            Ok(status) if status.success() => {
+                self.refresh_pane(pane, cx);
+                self.show_notice(format!("Duplicated “{}”", path_label(&path)), false, cx);
+            }
+            Ok(status) => self.show_notice(
+                format!("Duplicate failed with status {status}"),
+                true,
+                cx,
+            ),
+            Err(error) => self.show_operation_error("Duplicate", &path, &error, cx),
+        }
     }
 
     /// Make a Finder alias of `path` in the same folder.
@@ -6117,7 +6263,14 @@ impl Shuffle {
     /// Resolve and inspect a sidebar target only after the user activates it.
     fn open_sidebar_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let target = resolve_macos_alias(&path);
-        let is_dir = target.is_dir();
+        let metadata = match fs::metadata(&target) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.show_operation_error("Open", &target, &error, cx);
+                return;
+            }
+        };
+        let is_dir = metadata.is_dir();
         remember_path_kind(path, is_dir);
         if is_dir {
             self.navigate_to(target, cx);
@@ -9429,6 +9582,9 @@ impl Render for Shuffle {
         }
         if prefs().show_fps {
             root = root.child(fps_overlay());
+        }
+        if let Some(notice) = self.render_notice(cx) {
+            root = root.child(notice);
         }
         root
     }
