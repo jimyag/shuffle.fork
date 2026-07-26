@@ -2558,6 +2558,8 @@ struct Shuffle {
     palette_scroll: ScrollHandle,
     /// In-memory fuzzy index of ~/ (None until the background build finishes).
     index: Option<Arc<FileIndex>>,
+    /// True while an explicitly-requested global search is indexing ~/.
+    index_loading: bool,
     /// Lazily-built recursive index for one explicitly searched directory.
     recursive_index: Option<(PathBuf, Arc<FileIndex>)>,
     /// Directory currently being indexed for recursive search.
@@ -2635,8 +2637,6 @@ impl Shuffle {
         let finder_favorites = read_finder_favorites();
         ensure_base_icons(); // real folder/file icons ready before first render
         ensure_sidebar_icons(); // Mac/home icons
-        ensure_finder_favorite_icons(&finder_favorites);
-        ensure_dynamic_sidebar_icons(); // cloud providers + mounted volumes
         // Finder Favorites can change while Shuffle is in the background.
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
@@ -2743,8 +2743,6 @@ impl Shuffle {
             clear_icon_cache();
             ensure_base_icons();
             ensure_sidebar_icons();
-            ensure_finder_favorite_icons(&this.finder_favorites);
-            ensure_dynamic_sidebar_icons();
             cx.notify();
             this.prewarm_icons(cx);
         })
@@ -2781,6 +2779,7 @@ impl Shuffle {
             search_gen: 0,
             palette_scroll: ScrollHandle::new(),
             index: None,
+            index_loading: false,
             recursive_index: None,
             recursive_index_loading: None,
             context_menu: None,
@@ -2827,7 +2826,6 @@ impl Shuffle {
     fn refresh_finder_favorites(&mut self, cx: &mut Context<Self>) {
         let favorites = read_finder_favorites();
         if favorites != self.finder_favorites {
-            ensure_finder_favorite_icons(&favorites);
             self.finder_favorites = favorites;
             cx.notify();
         }
@@ -2872,7 +2870,6 @@ impl Shuffle {
     /// paint, then a background pass that fills in sizes/dates without blocking.
     fn reload_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
         let dir = self.tab(pane).current_dir.clone();
-        ensure_dynamic_sidebar_icons(); // pick up newly-mounted volumes/cloud
         // Stamp the mtime *before* reading so a change racing the read bumps
         // it again and the watcher catches it on the next tick.
         self.tab_mut(pane).dir_mtime = fs::metadata(&dir).ok().and_then(|m| m.modified().ok());
@@ -4485,14 +4482,19 @@ impl Shuffle {
             )
     }
 
-    /// Build the ~/ fuzzy index on a background thread, then store it.
-    fn build_index(&self, cx: &mut Context<Self>) {
+    /// Build the ~/ fuzzy index only after the user requests a global search.
+    fn ensure_global_index(&mut self, cx: &mut Context<Self>) {
+        if self.index.is_some() || self.index_loading {
+            return;
+        }
+        self.index_loading = true;
         cx.spawn(async move |this, cx| {
             let index = cx
                 .background_spawn(async move { FileIndex::build(home_dir()) })
                 .await;
             this.update(cx, |this, cx| {
                 this.index = Some(Arc::new(index));
+                this.index_loading = false;
                 cx.notify();
             })
             .ok();
@@ -4767,9 +4769,6 @@ impl Shuffle {
 
     fn set_search_scope(&mut self, scope: SearchScope, cx: &mut Context<Self>) {
         self.palette_mode = PaletteMode::Search(scope);
-        if scope == SearchScope::Recursive {
-            self.ensure_recursive_index(cx);
-        }
         self.refresh_palette(cx);
     }
 
@@ -4876,6 +4875,12 @@ impl Shuffle {
         }
 
         if self.palette_mode == PaletteMode::Search(SearchScope::Recursive) {
+            if q.is_empty() {
+                self.palette_items.clear();
+                cx.notify();
+                return;
+            }
+            self.ensure_recursive_index(cx);
             let root = self.active_tab().current_dir.clone();
             let index = self.recursive_index.as_ref().and_then(|(indexed_root, index)| {
                 (indexed_root == &root).then(|| index.clone())
@@ -4890,12 +4895,6 @@ impl Shuffle {
                 cx.notify();
                 return;
             };
-            if q.is_empty() {
-                self.palette_items.clear();
-                cx.notify();
-                return;
-            }
-
             self.palette_items.clear();
             cx.notify();
             cx.spawn(async move |this, cx| {
@@ -5015,6 +5014,9 @@ impl Shuffle {
         self.palette_items = command_matches(&q);
         self.selected = 0;
         cx.notify();
+        if self.palette_mode == PaletteMode::Search(SearchScope::Global) {
+            self.ensure_global_index(cx);
+        }
         let index = self.index.clone();
         cx.spawn(async move |this, cx| {
             // Debounce: bail if a newer keystroke superseded us.
@@ -6110,6 +6112,19 @@ impl Shuffle {
     /// Navigate the active pane (used by the palette).
     fn navigate_to(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         self.navigate_in(self.active_pane, dir, cx);
+    }
+
+    /// Resolve and inspect a sidebar target only after the user activates it.
+    fn open_sidebar_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let target = resolve_macos_alias(&path);
+        let is_dir = target.is_dir();
+        remember_path_kind(path, is_dir);
+        if is_dir {
+            self.navigate_to(target, cx);
+        } else {
+            let _ = Command::new("open").arg(target).spawn();
+            cx.notify();
+        }
     }
 
     /// Go to the previous directory in a pane's history (the back arrow).
@@ -8029,9 +8044,6 @@ impl Shuffle {
                 items.push(empty_hint("No Finder favorites").into_any_element());
             }
             for favorite in &self.finder_favorites {
-                if !cached_is_dir(&favorite.path) {
-                    continue;
-                }
                 push_nav(
                     &mut items,
                     cx,
@@ -9453,7 +9465,7 @@ fn push_nav(
         active,
         collapsed,
         cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.navigate_to(nav_target.clone(), cx);
+            this.open_sidebar_path(nav_target.clone(), cx);
         }),
         |_, _, _| {},
     );
@@ -9472,7 +9484,7 @@ fn push_bookmark_nav(
     collapsed: bool,
 ) {
     *key += 1;
-    let is_dir = cached_is_dir(&target);
+    let is_dir = cached_path_kind(&target).unwrap_or(target.as_path() == current);
     let active = is_dir && target.as_path() == current;
     let label = path_label(&target);
     let path_str = display_path(&target);
@@ -9491,11 +9503,7 @@ fn push_bookmark_nav(
         active,
         collapsed,
         cx.listener(move |this, _: &ClickEvent, _, cx| {
-            if nav_target.is_dir() {
-                this.navigate_to(nav_target.clone(), cx);
-            } else {
-                let _ = Command::new("open").arg(&nav_target).spawn();
-            }
+            this.open_sidebar_path(nav_target.clone(), cx);
         }),
         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
             let (x, y) = (f64::from(ev.position.x) as f32, f64::from(ev.position.y) as f32);
@@ -9519,7 +9527,7 @@ fn push_group_member(
     collapsed: bool,
 ) {
     *key += 1;
-    let is_dir = cached_is_dir(&target);
+    let is_dir = cached_path_kind(&target).unwrap_or(target.as_path() == current);
     let active = is_dir && target.as_path() == current;
     let label = path_label(&target);
     let path_str = display_path(&target);
@@ -9538,11 +9546,7 @@ fn push_group_member(
         active,
         collapsed,
         cx.listener(move |this, _: &ClickEvent, _, cx| {
-            if nav_target.is_dir() {
-                this.navigate_to(nav_target.clone(), cx);
-            } else {
-                let _ = Command::new("open").arg(&nav_target).spawn();
-            }
+            this.open_sidebar_path(nav_target.clone(), cx);
         }),
         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
             let (x, y) = (f64::from(ev.position.x) as f32, f64::from(ev.position.y) as f32);
@@ -10550,12 +10554,11 @@ fn read_finder_favorites() -> Vec<FinderFavorite> {
             let Some(path) = url.to_file_path() else {
                 continue;
             };
-            let path = resolve_macos_alias(&path);
             if !seen.insert(path.clone()) {
                 continue;
             }
 
-            let label = item.display_name().to_string();
+            let label = finder_favorite_label(&item.display_name().to_string(), &path);
             let label = if label.is_empty() {
                 path.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -10568,6 +10571,39 @@ fn read_finder_favorites() -> Vec<FinderFavorite> {
     }
 
     favorites
+}
+
+/// Finder re-localizes standard folders for the current UI language, while
+/// LSSharedFileList can retain a label from the language used when it was
+/// originally added. Match Finder for those system-owned locations and keep
+/// custom labels for every other favorite.
+fn finder_favorite_label(shared_list_label: &str, path: &Path) -> String {
+    let home = home_dir();
+    let is_system_folder = path == Path::new("/Applications")
+        || (path.parent() == Some(home.as_path())
+            && path.file_name().is_some_and(|name| {
+                matches!(
+                    name.to_str(),
+                    Some(
+                        "Applications"
+                            | "Desktop"
+                            | "Documents"
+                            | "Downloads"
+                            | "Movies"
+                            | "Music"
+                            | "Pictures"
+                            | "Public"
+                    )
+                )
+            }));
+    if !is_system_folder {
+        return shared_list_label.to_string();
+    }
+
+    let path = NSString::from_str(&path.to_string_lossy());
+    NSFileManager::defaultManager()
+        .displayNameAtPath(&path)
+        .to_string()
 }
 
 /// Resolve a Finder alias file to its target without showing UI or mounting
@@ -10583,20 +10619,6 @@ fn resolve_macos_alias(path: &Path) -> PathBuf {
         .and_then(|resolved| resolved.path())
         .map(|resolved| PathBuf::from(resolved.to_string()))
         .unwrap_or_else(|| path.to_path_buf())
-}
-
-/// Cache Finder Favorites icons by path, matching dynamic location rows.
-fn ensure_finder_favorite_icons(favorites: &[FinderFavorite]) {
-    for favorite in favorites {
-        let key = favorite.path.to_string_lossy().into_owned();
-        if ICON_CACHE.with(|c| c.borrow().contains_key(&key)) {
-            continue;
-        }
-        let icon = build_macos_icon(&favorite.path);
-        ICON_CACHE.with(|c| {
-            c.borrow_mut().insert(key, icon);
-        });
-    }
 }
 
 thread_local! {
@@ -10683,46 +10705,25 @@ fn sidebar_locations() -> (Vec<(String, PathBuf)>, Vec<(String, PathBuf)>) {
     }
 }
 
-/// `stat` results for sidebar rows (bookmarks, group members, favorites),
-/// cached so `render` never touches the filesystem per frame — a single dead
-/// network bookmark would otherwise freeze every repaint. Stale entries are
-/// re-checked on a background thread.
-static DIR_STAT: OnceLock<Mutex<HashMap<PathBuf, (bool, Instant)>>> = OnceLock::new();
-static DIR_STAT_SCANNING: AtomicBool = AtomicBool::new(false);
+/// File-vs-directory knowledge learned only after a sidebar item is activated.
+/// A cache miss deliberately performs no filesystem access.
+static PATH_KIND: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
 
-fn cached_is_dir(path: &Path) -> bool {
-    const TTL: Duration = Duration::from_secs(3);
-    let map = DIR_STAT.get_or_init(|| Mutex::new(HashMap::new()));
-    let hit = map.lock().unwrap().get(path).copied();
-    match hit {
-        Some((v, at)) => {
-            if at.elapsed() > TTL && !DIR_STAT_SCANNING.swap(true, Ordering::SeqCst) {
-                std::thread::spawn(|| {
-                    let map = DIR_STAT.get().unwrap();
-                    let stale: Vec<PathBuf> = {
-                        let m = map.lock().unwrap();
-                        m.iter()
-                            .filter(|(_, (_, at))| at.elapsed() > TTL)
-                            .map(|(p, _)| p.clone())
-                            .collect()
-                    };
-                    for p in stale {
-                        let v = p.is_dir(); // may block; we're off-thread
-                        map.lock().unwrap().insert(p, (v, Instant::now()));
-                    }
-                    DIR_STAT_SCANNING.store(false, Ordering::SeqCst);
-                });
-            }
-            v
-        }
-        None => {
-            // First sighting (startup / newly added): one synchronous stat so
-            // the answer is correct immediately.
-            let v = path.is_dir();
-            map.lock().unwrap().insert(path.to_path_buf(), (v, Instant::now()));
-            v
-        }
-    }
+fn cached_path_kind(path: &Path) -> Option<bool> {
+    PATH_KIND
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+}
+
+fn remember_path_kind(path: PathBuf, is_dir: bool) {
+    PATH_KIND
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(path, is_dir);
 }
 
 /// Cloud-storage locations macOS syncs to disk: iCloud Drive plus every
@@ -10792,31 +10793,6 @@ fn mounted_volumes() -> Vec<(String, PathBuf)> {
     }
     out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     out
-}
-
-/// Paths whose real macOS icon should be cached for the sidebar (cloud
-/// providers + mounted volumes). These are dynamic, so their icons are keyed by
-/// the path string and (re)built by [`ensure_dynamic_sidebar_icons`].
-fn dynamic_sidebar_paths() -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = cloud_locations().into_iter().map(|(_, p)| p).collect();
-    v.extend(mounted_volumes().into_iter().map(|(_, p)| p));
-    v
-}
-
-/// Build the real macOS icons for the currently-mounted volumes and synced
-/// cloud folders, keyed by path. Cheap (icon_tiff is a few ms) and main-thread,
-/// so it's safe to call on navigation / startup — never from render.
-fn ensure_dynamic_sidebar_icons() {
-    for p in dynamic_sidebar_paths() {
-        let key = p.to_string_lossy().into_owned();
-        if ICON_CACHE.with(|c| c.borrow().contains_key(&key)) {
-            continue;
-        }
-        let icon = build_macos_icon(&p);
-        ICON_CACHE.with(|c| {
-            c.borrow_mut().insert(key, icon);
-        });
-    }
 }
 
 // ----- native Quick Look ----------------------------------------------------
@@ -12661,7 +12637,6 @@ fn open_main_window(cx: &mut App) {
             let view = cx.new(|cx| {
                 let mut finder = Shuffle::new(load_last_dir(), window, cx);
                 finder.prewarm_icons(cx);
-                finder.build_index(cx);
                 // Quietly check GitHub for a newer release (shows a banner if so).
                 finder.check_for_update(cx);
                 // Fill the initial folder's metadata in the background.
