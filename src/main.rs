@@ -2258,6 +2258,7 @@ enum PaletteMode {
 enum SearchScope {
     CurrentFolder,
     Recursive,
+    Global,
 }
 
 /// An open right-click context menu: where it sits, and the entry it targets
@@ -4817,28 +4818,11 @@ impl Shuffle {
         cx.notify();
     }
 
-    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette_open && self.palette_mode == PaletteMode::Commands {
+    fn toggle_search_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open {
             self.close_palette(cx);
         } else {
-            self.open_palette(PaletteMode::Commands, window, cx);
-        }
-    }
-
-    fn toggle_current_folder_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette_open
-            && matches!(
-                self.palette_mode,
-                PaletteMode::Search(SearchScope::CurrentFolder)
-            )
-        {
-            self.close_palette(cx);
-        } else {
-            self.open_palette(
-                PaletteMode::Search(SearchScope::CurrentFolder),
-                window,
-                cx,
-            );
+            self.open_palette(PaletteMode::Search(SearchScope::Global), window, cx);
         }
     }
 
@@ -5271,13 +5255,13 @@ impl Shuffle {
         let pane = self.active_pane;
         let anchor = self.tab(pane).anchor.clone();
         match action {
-            KeyAction::CommandPalette => self.toggle_palette(window, cx),
+            KeyAction::CommandPalette => self.toggle_search_palette(window, cx),
             KeyAction::NewTab => self.new_tab_in(pane, cx),
             KeyAction::CloseTab => {
                 let a = self.panes[pane].active;
                 self.close_tab(pane, a, cx);
             }
-            KeyAction::Find => self.toggle_current_folder_search(window, cx),
+            KeyAction::Find => self.toggle_search_palette(window, cx),
             KeyAction::SelectAll => {
                 let all: HashSet<PathBuf> = self.display_paths(pane).into_iter().collect();
                 self.tab_mut(pane).selection = all;
@@ -5476,7 +5460,11 @@ impl Shuffle {
             self.refresh_palette(cx);
             return;
         }
-        if self.palette_mode == PaletteMode::Commands && prefs().palette_history {
+        if matches!(
+            self.palette_mode,
+            PaletteMode::Commands | PaletteMode::Search(SearchScope::Global)
+        ) && prefs().palette_history
+        {
             if km.get(KeyAction::PaletteHistoryPrev) == Some(kc.as_str()) {
                 self.palette_history_prev(cx);
                 return;
@@ -5715,7 +5703,11 @@ impl Shuffle {
 
     /// Record a submitted query into the palette history (when enabled).
     fn record_palette_history(&mut self) {
-        if self.palette_mode != PaletteMode::Commands || !prefs().palette_history {
+        if !matches!(
+            self.palette_mode,
+            PaletteMode::Commands | PaletteMode::Search(SearchScope::Global)
+        ) || !prefs().palette_history
+        {
             return;
         }
         let q = self.query.trim().to_string();
@@ -5803,6 +5795,9 @@ impl Shuffle {
             PaletteMode::Search(SearchScope::Recursive) => {
                 "Search the current folder recursively…"
             }
+            PaletteMode::Search(SearchScope::Global) => {
+                "Search all indexed files, paths, and commands…"
+            }
         };
         let input = if self.query.is_empty() {
             div()
@@ -5871,6 +5866,11 @@ impl Shuffle {
                         "search-recursive",
                         "Recursive",
                         SearchScope::Recursive,
+                    ))
+                    .child(scope_button(
+                        "search-global",
+                        "Global",
+                        SearchScope::Global,
                     ))
                     .into_any_element()
             }
@@ -8569,7 +8569,7 @@ impl Shuffle {
                     this.set_view(pane, mode, cx);
                 }))
         };
-        // Magnifier for a focused search of the active pane's current folder.
+        // Cmd+P, /, and the magnifier all open the same search palette.
         let search_btn = div()
             .id(("palette-search", pane))
             .flex_none()
@@ -8585,7 +8585,7 @@ impl Shuffle {
             .child("🔍")
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.active_pane = pane;
-                this.toggle_current_folder_search(window, cx);
+                this.toggle_search_palette(window, cx);
             }));
         div()
             .flex_none()
