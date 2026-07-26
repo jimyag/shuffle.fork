@@ -23,7 +23,7 @@ use gpui::{
     actions, anchored, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size,
     uniform_list, Animation, AnimationExt, AnyElement, App,
     Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, ImageSource,
-    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
     PathPromptOptions, Rgba,
     RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions,
@@ -33,7 +33,7 @@ use objc2::{define_class, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSDraggingContext,
     NSDraggingSession, NSDraggingSource, NSDragOperation, NSGraphicsContext, NSImage,
-    NSPDFImageRep, NSWorkspace,
+    NSWorkspace,
 };
 use objc2_core_foundation::{CFArray, CFRetained, CFType};
 use objc2_core_services::{
@@ -324,10 +324,6 @@ struct Prefs {
     terminal: bool,
     /// Also show a scrollback of what you've typed / command output.
     term_history: bool,
-    /// Show a file preview in the inspector when a file is selected.
-    preview: bool,
-    /// Show ‹ › page arrows on multi-page PDF previews in the inspector.
-    preview_pages: bool,
     /// Show file information in the inspector when a file is selected.
     info: bool,
     /// Show the leading ".." row that goes up one level.
@@ -349,8 +345,6 @@ impl Default for Prefs {
         Prefs {
             terminal: false,
             term_history: false,
-            preview: false,
-            preview_pages: true,
             info: false,
             show_parent: true,
             sidebar_collapsed: false,
@@ -370,8 +364,6 @@ thread_local! {
     static ACTIVE_PREFS: RefCell<Prefs> = const { RefCell::new(Prefs {
         terminal: false,
         term_history: false,
-        preview: false,
-        preview_pages: true,
         info: false,
         show_parent: true,
         sidebar_collapsed: false,
@@ -1166,32 +1158,6 @@ impl Settings {
                 cx.listener(|_, _: &ClickEvent, _, cx| {
                     let mut np = prefs();
                     np.term_history = !np.term_history;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-preview",
-                "Preview",
-                "Click a file once to preview it (images, PDFs, documents, …) in \
-                 the inspector panel.",
-                p.preview,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.preview = !np.preview;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-preview-pages",
-                "Preview page controls",
-                "Show ‹ › arrows under multi-page PDF previews to flip through \
-                 the pages without opening the file.",
-                p.preview_pages,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.preview_pages = !np.preview_pages;
                     apply_prefs(np, cx);
                     cx.notify();
                 }),
@@ -2375,7 +2341,6 @@ enum ViewMode {
     List,
     Icons,
     Columns,
-    Gallery,
 }
 
 /// One open tab: an independent directory view with its own history, scroll,
@@ -2622,8 +2587,6 @@ struct Shuffle {
     /// State of the self-updater's banner. `None` = up to date / not checked /
     /// dismissed.
     update: Option<UpdateStatus>,
-    /// Current page of the inspector's PDF preview (0-based; reset on focus).
-    preview_page: usize,
     /// The row the mouse is currently over: (pane, path). Enter renames it
     /// even when nothing is selected (point-and-rename).
     hovered: Option<(usize, PathBuf)>,
@@ -2833,7 +2796,6 @@ impl Shuffle {
             term_focused: false,
             term_scroll: ScrollHandle::new(),
             update: None,
-            preview_page: 0,
             hovered: None,
             drop_hover: None,
         }
@@ -2974,21 +2936,6 @@ impl Shuffle {
     fn set_view(&mut self, pane: usize, mode: ViewMode, cx: &mut Context<Self>) {
         self.active_pane = pane;
         self.tab_mut(pane).view = mode;
-        // Gallery needs a focused item + its preview to show something at once.
-        if mode == ViewMode::Gallery {
-            let sel = self.tab(pane).anchor.clone().or_else(|| {
-                let dir = self.tab(pane).current_dir.clone();
-                self.tab(pane)
-                    .entries
-                    .iter()
-                    .find(|e| !e.is_dir)
-                    .map(|e| dir.join(&e.name))
-            });
-            if let Some(p) = sel {
-                self.tab_mut(pane).anchor = Some(p.clone());
-                self.ensure_preview(p, true, cx);
-            }
-        }
         cx.notify();
     }
 
@@ -3569,18 +3516,13 @@ impl Shuffle {
         self.close_context_menu(cx);
     }
 
-    /// After an in-place edit, drop stale caches and refresh the listing.
+    /// After an in-place edit, drop stale information and refresh the listing.
     fn refresh_after_edit(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
-        PREVIEW_CACHE.with(|c| {
-            c.borrow_mut().remove(&path);
-        });
         INFO_CACHE.with(|c| {
             c.borrow_mut().remove(&path);
         });
         self.refresh_pane(pane, cx);
         if self.tab(pane).anchor.as_deref() == Some(path.as_path()) {
-            let gallery = self.tab(pane).view == ViewMode::Gallery;
-            self.ensure_preview(path.clone(), gallery, cx);
             self.ensure_info(path, cx);
         }
     }
@@ -6852,15 +6794,9 @@ impl Shuffle {
         }
     }
 
-    /// Make `path` the inspector focus and load its preview/info.
+    /// Make `path` the inspector focus and load its information.
     fn focus_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
-        let gallery = self.tab(pane).view == ViewMode::Gallery;
         self.tab_mut(pane).anchor = Some(path.clone());
-        self.preview_page = 0;
-        self.ensure_preview(path.clone(), gallery, cx);
-        if prefs().preview && prefs().preview_pages {
-            self.ensure_pdf_page(path.clone(), 0, cx);
-        }
         self.ensure_info(path, cx);
     }
 
@@ -7242,7 +7178,7 @@ impl Shuffle {
                 let cols = self.icon_cols(pane) as i32;
                 self.arrow_grid(pane, dx + dy * cols, cx);
             }
-            // List & Gallery are 1-D: only up/down move.
+            // List is 1-D: only up/down move.
             _ => {
                 if dy != 0 {
                     self.arrow_grid(pane, dy, cx);
@@ -7251,7 +7187,7 @@ impl Shuffle {
         }
     }
 
-    /// Move the anchor by `delta` positions in display order (List/Icons/Gallery).
+    /// Move the anchor by `delta` positions in display order (List/Icons).
     fn arrow_grid(&mut self, pane: usize, delta: i32, cx: &mut Context<Self>) {
         let paths = self.display_paths(pane);
         if paths.is_empty() {
@@ -7374,54 +7310,6 @@ impl Shuffle {
         .detach();
     }
 
-    /// Build a preview for `path` in the background (once), then repaint.
-    /// `force` generates it even when the Preview pref is off (Gallery view).
-    fn ensure_preview(&self, path: PathBuf, force: bool, cx: &mut Context<Self>) {
-        if (!force && !prefs().preview) || lookup_preview(&path).is_some() {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            let p = path.clone();
-            let img = cx.background_spawn(async move { build_preview(&p) }).await;
-            let _ = this.update(cx, |_, cx| {
-                PREVIEW_CACHE.with(|c| {
-                    c.borrow_mut().insert(path, img);
-                });
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Render one page of a PDF for the inspector pager in the background
-    /// (once), recording the document's page count along the way.
-    fn ensure_pdf_page(&self, path: PathBuf, page: usize, cx: &mut Context<Self>) {
-        if !is_pdf(&path) || lookup_pdf_page(&path, page).is_some() {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            let p = path.clone();
-            let out = cx.background_spawn(async move { render_pdf_page(&p, page) }).await;
-            let _ = this.update(cx, |this, cx| {
-                match out {
-                    Some((img, count)) => {
-                        insert_pdf_page(path.clone(), page, Some(img));
-                        PDF_COUNT_CACHE.with(|c| {
-                            c.borrow_mut().insert(path.clone(), count);
-                        });
-                        // Have the second page ready before the first ‹ › click.
-                        if page == 0 && count > 1 {
-                            this.ensure_pdf_page(path, 1, cx);
-                        }
-                    }
-                    None => insert_pdf_page(path, page, None),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     /// The floating "why this name won't work" pill shown over `pane` while an
     /// in-progress rename there has an invalid name.
     fn rename_error_pill(&self, pane: usize) -> Option<AnyElement> {
@@ -7459,14 +7347,9 @@ impl Shuffle {
         )
     }
 
-    /// The right-hand inspector: preview and/or information for the selected
-    /// file. `None` when neither feature is on or nothing is selected.
-    fn render_inspector(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let p = prefs();
-        // In Gallery view the big preview already shows, so don't duplicate it
-        // in the side inspector even when the Preview toggle is on.
-        let show_preview = p.preview && self.active_tab().view != ViewMode::Gallery;
-        if !show_preview && !p.info {
+    /// The right-hand information inspector for the selected file.
+    fn render_inspector(&self, _cx: &Context<Self>) -> Option<AnyElement> {
+        if !prefs().info {
             return None;
         }
         let sel = self.active_tab().anchor.clone()?;
@@ -7490,151 +7373,32 @@ impl Shuffle {
                     .text_color(rgb(t.text))
                     .truncate()
                     .child(path_label(&sel)),
+            )
+            .child(settings_title("Information"));
+        if let Some(info) = lookup_info(&sel) {
+            let mut rows = div().flex().flex_col().gap_1();
+            rows = rows.child(info_row("Kind", &info.kind));
+            rows = rows.child(info_row("Size", &info.size));
+            rows = rows.child(info_row("Created", &info.created));
+            rows = rows.child(info_row("Modified", &info.modified));
+            rows = rows.child(info_row("Last opened", &info.accessed));
+            if let Some(d) = &info.dimensions {
+                rows = rows.child(info_row("Dimensions", d));
+            }
+            if let Some(c) = &info.color {
+                rows = rows.child(info_row("Color", c));
+            }
+            if let Some(s) = &info.signed {
+                rows = rows.child(info_row("Signature", s));
+            }
+            col = col.child(rows);
+        } else {
+            col = col.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(t.text_dim))
+                    .child("Loading…"),
             );
-
-        if show_preview {
-            // Multi-page PDFs: show the natively rendered current page when the
-            // pager is on, falling back to the QuickLook thumbnail (page 1)
-            // while it builds.
-            let paging = p.preview_pages && is_pdf(&sel);
-            let page_count = if paging { lookup_pdf_count(&sel) } else { None };
-            let page = self
-                .preview_page
-                .min(page_count.unwrap_or(1).saturating_sub(1));
-            let page_img = if paging {
-                lookup_pdf_page(&sel, page).flatten()
-            } else {
-                None
-            };
-            let handle = page_img.or_else(|| lookup_preview(&sel).flatten());
-            let body: AnyElement = match handle {
-                Some(handle) => img(ImageSource::Render(handle))
-                    .max_w(px(288.0))
-                    .max_h(px(360.0))
-                    .object_fit(ObjectFit::Contain)
-                    .into_any_element(),
-                // Not ready yet or unavailable → show the file's icon.
-                None => icon_element_sized(&sel, false, 96.0),
-            };
-            let preview_box = div()
-                .relative()
-                .flex()
-                .items_center()
-                .justify_center()
-                .w_full()
-                .min_h(px(120.0))
-                .p_2()
-                .rounded_md()
-                // White "page" so document/text previews (black text, often
-                // transparent background) stay readable on dark themes.
-                .bg(rgb(0xffffff))
-                .child(body);
-
-            // Finder-style ‹ 2 / 14 › pill over the bottom of the preview.
-            if let Some(count) = page_count.filter(|&c| c > 1) {
-                let prev_sel = sel.clone();
-                let next_sel = sel.clone();
-                let pager_btn = |id: &'static str, label: &'static str, enabled: bool| {
-                    div()
-                        .id(id)
-                        .px_1p5()
-                        .rounded_full()
-                        .cursor_pointer()
-                        .text_color(if enabled {
-                            rgba(0xffffffff)
-                        } else {
-                            rgba(0xffffff44)
-                        })
-                        .when(enabled, |s| s.hover(|s| s.bg(rgba(0xffffff33))))
-                        .child(label)
-                };
-                col = col.child(
-                    preview_box.child(
-                        div()
-                            .absolute()
-                            .bottom_2()
-                            .left_0()
-                            .right_0()
-                            .flex()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_1()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(rgba(0x000000aa))
-                                    .text_xs()
-                                    .child(pager_btn("pdf-prev", "‹", page > 0).on_click(
-                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            if this.preview_page > 0 {
-                                                this.preview_page -= 1;
-                                                let pg = this.preview_page;
-                                                this.ensure_pdf_page(prev_sel.clone(), pg, cx);
-                                                if pg > 0 {
-                                                    this.ensure_pdf_page(prev_sel.clone(), pg - 1, cx);
-                                                }
-                                                cx.notify();
-                                            }
-                                        }),
-                                    ))
-                                    .child(
-                                        div()
-                                            .text_color(rgba(0xffffffdd))
-                                            .child(format!("{} / {}", page + 1, count)),
-                                    )
-                                    .child(pager_btn("pdf-next", "›", page + 1 < count).on_click(
-                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            let count =
-                                                lookup_pdf_count(&next_sel).unwrap_or(1);
-                                            if this.preview_page + 1 < count {
-                                                this.preview_page += 1;
-                                                let pg = this.preview_page;
-                                                this.ensure_pdf_page(next_sel.clone(), pg, cx);
-                                                if pg + 1 < count {
-                                                    this.ensure_pdf_page(next_sel.clone(), pg + 1, cx);
-                                                }
-                                                cx.notify();
-                                            }
-                                        }),
-                                    )),
-                            ),
-                    ),
-                );
-            } else {
-                col = col.child(preview_box);
-            }
-        }
-
-        if p.info {
-            col = col.child(settings_title("Information"));
-            if let Some(info) = lookup_info(&sel) {
-                let mut rows = div().flex().flex_col().gap_1();
-                rows = rows.child(info_row("Kind", &info.kind));
-                rows = rows.child(info_row("Size", &info.size));
-                rows = rows.child(info_row("Created", &info.created));
-                rows = rows.child(info_row("Modified", &info.modified));
-                rows = rows.child(info_row("Last opened", &info.accessed));
-                if let Some(d) = &info.dimensions {
-                    rows = rows.child(info_row("Dimensions", d));
-                }
-                if let Some(c) = &info.color {
-                    rows = rows.child(info_row("Color", c));
-                }
-                if let Some(s) = &info.signed {
-                    rows = rows.child(info_row("Signature", s));
-                }
-                col = col.child(rows);
-            } else {
-                col = col.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(t.text_dim))
-                        .child("Loading…"),
-                );
-            }
         }
 
         Some(col.into_any_element())
@@ -8548,7 +8312,7 @@ impl Shuffle {
             .child(self.render_view_toolbar(pane, cx))
     }
 
-    /// View-mode switcher (list / icons / gallery) + the Sort-By button.
+    /// View-mode switcher (list / icons / columns) + the Sort-By button.
     fn render_view_toolbar(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
         let t = theme();
         let view = self.tab(pane).view;
@@ -8600,7 +8364,6 @@ impl Shuffle {
             .child(btn("view-list", "☰", ViewMode::List, cx))
             .child(btn("view-icons", "▦", ViewMode::Icons, cx))
             .child(btn("view-columns", "▥", ViewMode::Columns, cx))
-            .child(btn("view-gallery", "▭", ViewMode::Gallery, cx))
             .child(
                 // Sort-By button — opens a dropdown at the click location.
                 div()
@@ -8999,7 +8762,6 @@ impl Shuffle {
             ViewMode::List => self.render_list_body(pane, cx),
             ViewMode::Icons => self.render_icons_body(pane, cx),
             ViewMode::Columns => self.render_columns_body(pane, cx),
-            ViewMode::Gallery => self.render_gallery_body(pane, cx),
         };
 
         div()
@@ -9433,109 +9195,6 @@ impl Shuffle {
             .flex()
             .flex_row()
             .children(cols)
-            .into_any_element()
-    }
-
-    /// The Gallery view body: a large preview on top + a filmstrip below.
-    fn render_gallery_body(&self, pane: usize, cx: &Context<Self>) -> AnyElement {
-        let t = theme();
-        let tab = self.tab(pane);
-        let pane_dir = tab.current_dir.clone();
-        let sel = tab.anchor.clone();
-
-        // Top preview area (white page so documents stay readable).
-        let preview: AnyElement = match &sel {
-            Some(p) => match lookup_preview(p) {
-                Some(Some(handle)) => img(ImageSource::Render(handle))
-                    .max_w(px(560.0))
-                    .max_h(px(560.0))
-                    .object_fit(ObjectFit::Contain)
-                    .into_any_element(),
-                // Not ready yet or unavailable → show the file's large icon.
-                _ => icon_element_sized(p, false, 128.0),
-            },
-            None => div()
-                .text_color(rgb(t.text_dim))
-                .child("Select an item")
-                .into_any_element(),
-        };
-
-        // Filmstrip (capped for very large directories).
-        let mut strip: Vec<AnyElement> = Vec::new();
-        for entry in tab.entries.iter().take(400) {
-            let name = entry.name.clone();
-            let is_dir = entry.is_dir;
-            let target = pane_dir.join(&name);
-            let selected = tab.selection.contains(&target);
-            let nav_t = target.clone();
-            strip.push(
-                div()
-                    .id(SharedString::from(format!("film:{}", target.to_string_lossy())))
-                    .flex_none()
-                    .w(px(80.0))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_1()
-                    .p_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(selected, |s| s.bg(rgb(t.selected)))
-                    .hover(|s| s.bg(rgb(t.hover)))
-                    .child(icon_element_sized(&target, is_dir, 44.0))
-                    .child(div().w_full().truncate().text_xs().text_color(rgb(t.text_muted)).child(name))
-                    .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                        if ev.click_count() >= 2 {
-                            this.open_path(pane, nav_t.clone(), is_dir, cx);
-                        } else {
-                            this.select_entry(pane, nav_t.clone(), cx);
-                        }
-                    }))
-                    .into_any_element(),
-            );
-        }
-
-        div()
-            .flex_1()
-            .min_h_0()
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p_4()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .max_w(px(600.0))
-                            .max_h(px(600.0))
-                            .p_2()
-                            .rounded_md()
-                            .bg(rgb(0xffffff))
-                            .child(preview),
-                    ),
-            )
-            .child(
-                div()
-                    .id(("filmstrip", pane))
-                    .flex_none()
-                    .h(px(108.0))
-                    .overflow_x_scroll()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .border_t_1()
-                    .border_color(rgb(t.border))
-                    .bg(rgb(t.sidebar))
-                    .children(strip),
-            )
             .into_any_element()
     }
 
@@ -10724,7 +10383,7 @@ fn icon_element(path: &Path, is_dir: bool) -> AnyElement {
     icon_element_sized(path, is_dir, 16.0)
 }
 
-/// Like [`icon_element`] but at an explicit pixel size (for the icon/gallery views).
+/// Like [`icon_element`] but at an explicit pixel size (for the icon view).
 fn icon_element_sized(path: &Path, is_dir: bool, size: f32) -> AnyElement {
     // Cache-only lookup — never build on the render thread. Directories use the
     // shared generic folder icon (built synchronously at startup, so no emoji
@@ -11368,7 +11027,7 @@ fn icon_tiff(path: &Path) -> Option<Vec<u8>> {
 /// expensive part — the large TIFF decode), safe to run off the main thread.
 fn decode_icon(tiff: &[u8]) -> Option<Arc<RenderImage>> {
     let decoded = image::load_from_memory(tiff).ok()?;
-    // 128px stays crisp in the Icons/Gallery views; the GPU downscales cleanly
+    // 128px stays crisp in the Icons view; the GPU downscales cleanly
     // to 16px in list view. One cached icon per file type.
     let decoded = decoded.resize_exact(128, 128, image::imageops::FilterType::Lanczos3);
     let rgba = decoded.to_rgba8();
@@ -11391,151 +11050,12 @@ fn build_macos_icon(path: &Path) -> Option<Arc<RenderImage>> {
 }
 
 thread_local! {
-    /// Cache of generated file previews. `None` = generation failed/unavailable.
-    static PREVIEW_CACHE: RefCell<HashMap<PathBuf, Option<Arc<RenderImage>>>> =
-        RefCell::new(HashMap::new());
     /// Cache of gathered file information.
     static INFO_CACHE: RefCell<HashMap<PathBuf, FileInfo>> = RefCell::new(HashMap::new());
 }
 
-fn lookup_preview(path: &Path) -> Option<Option<Arc<RenderImage>>> {
-    PREVIEW_CACHE.with(|c| c.borrow().get(path).cloned())
-}
-
-thread_local! {
-    /// Rendered PDF pages for the inspector pager: (path, page) → image.
-    /// `None` = that page couldn't be rendered.
-    static PDF_PAGE_CACHE: RefCell<HashMap<(PathBuf, usize), Option<Arc<RenderImage>>>> =
-        RefCell::new(HashMap::new());
-    /// Page counts of PDFs we've rendered at least one page of.
-    static PDF_COUNT_CACHE: RefCell<HashMap<PathBuf, usize>> = RefCell::new(HashMap::new());
-}
-
-fn lookup_pdf_page(path: &Path, page: usize) -> Option<Option<Arc<RenderImage>>> {
-    PDF_PAGE_CACHE.with(|c| c.borrow().get(&(path.to_path_buf(), page)).cloned())
-}
-
-fn lookup_pdf_count(path: &Path) -> Option<usize> {
-    PDF_COUNT_CACHE.with(|c| c.borrow().get(path).copied())
-}
-
-/// Insert a rendered page, evicting far-away pages so flipping through a long
-/// PDF can't accumulate unbounded image memory (each page is a few MB).
-fn insert_pdf_page(path: PathBuf, page: usize, img: Option<Arc<RenderImage>>) {
-    PDF_PAGE_CACHE.with(|c| {
-        let mut m = c.borrow_mut();
-        if m.len() >= 12 {
-            let lo = page.saturating_sub(3);
-            let hi = page + 3;
-            m.retain(|(p, pg), _| p == &path && (lo..=hi).contains(pg));
-        }
-        m.insert((path, page), img);
-    });
-}
-
-/// Rasterize one page of a PDF via AppKit's `NSPDFImageRep`, off the render
-/// thread. Returns the page image and the document's page count.
-fn render_pdf_page(path: &Path, page: usize) -> Option<(Arc<RenderImage>, usize)> {
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
-
-    let bytes = fs::read(path).ok()?;
-    let data = NSData::with_bytes(&bytes);
-    let rep = NSPDFImageRep::imageRepWithData(&data)?;
-    let count = rep.pageCount().max(1) as usize;
-    rep.setCurrentPage(page.min(count - 1) as isize);
-
-    let size = rep.size();
-    if size.width < 1.0 || size.height < 1.0 {
-        return None;
-    }
-    // ~800px on the long edge: crisp at the inspector's 288px (incl. retina)
-    // without ballooning the page cache.
-    let scale = (800.0 / size.width.max(size.height)).clamp(0.5, 4.0);
-    let (w, h) = (
-        (size.width * scale).round() as isize,
-        (size.height * scale).round() as isize,
-    );
-
-    let bmp = unsafe {
-        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
-            NSBitmapImageRep::alloc(),
-            std::ptr::null_mut(),
-            w,
-            h,
-            8,
-            4,
-            true,
-            false,
-            NSDeviceRGBColorSpace,
-            0,
-            0,
-        )
-    }?;
-    let ctx = NSGraphicsContext::graphicsContextWithBitmapImageRep(&bmp)?;
-    NSGraphicsContext::saveGraphicsState_class();
-    NSGraphicsContext::setCurrentContext(Some(&ctx));
-    let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w as f64, h as f64));
-    let ok = rep.drawInRect(dst);
-    NSGraphicsContext::restoreGraphicsState_class();
-    if !ok {
-        return None;
-    }
-
-    let tiff = bmp.TIFFRepresentation()?;
-    if tiff.len() == 0 {
-        return None;
-    }
-    let decoded = image::load_from_memory(&tiff.to_vec()).ok()?;
-    let rgba = decoded.to_rgba8();
-    let (dw, dh) = rgba.dimensions();
-    let mut raw = rgba.into_raw();
-    for px in raw.chunks_exact_mut(4) {
-        px.swap(0, 2); // RGBA → BGRA
-    }
-    let buffer = image::RgbaImage::from_raw(dw, dh, raw)?;
-    Some((
-        Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
-        count,
-    ))
-}
-
 fn lookup_info(path: &Path) -> Option<FileInfo> {
     INFO_CACHE.with(|c| c.borrow().get(path).cloned())
-}
-
-/// Generate a preview image for any file via macOS QuickLook (`qlmanage -t`),
-/// then decode it into a GPUI `RenderImage`. Runs off the render thread.
-fn build_preview(path: &Path) -> Option<Arc<RenderImage>> {
-    let out_dir = std::env::temp_dir().join("shuffle-preview");
-    let _ = fs::create_dir_all(&out_dir);
-    let name = path.file_name()?.to_string_lossy().into_owned();
-    let png = out_dir.join(format!("{name}.png"));
-    let _ = fs::remove_file(&png); // avoid showing a stale preview
-
-    // QuickLook renders almost anything (images, PDFs, Office docs, code, …).
-    let ok = Command::new("qlmanage")
-        .args(["-t", "-s", "600", "-o"])
-        .arg(&out_dir)
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok || !png.exists() {
-        return None;
-    }
-
-    let decoded = image::open(&png).ok()?;
-    let decoded = decoded.thumbnail(600, 600); // bound memory; keeps aspect
-    let rgba = decoded.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let mut raw = rgba.into_raw();
-    for px in raw.chunks_exact_mut(4) {
-        px.swap(0, 2); // RGBA → BGRA
-    }
-    let buffer = image::RgbaImage::from_raw(w, h, raw)?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
 /// Everything we display in the Information inspector for one file.
@@ -12774,8 +12294,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_fps={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_fps
+            "terminal={}\nterm_history={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_fps={}\n",
+            p.terminal, p.term_history, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_fps
         );
         let _ = fs::write(&file, body);
     }
@@ -12899,8 +12419,6 @@ fn load_prefs() -> Prefs {
                 match k.trim() {
                     "terminal" => p.terminal = on,
                     "term_history" => p.term_history = on,
-                    "preview" => p.preview = on,
-                    "preview_pages" => p.preview_pages = on,
                     "info" => p.info = on,
                     "show_parent" => p.show_parent = on,
                     "sidebar_collapsed" => p.sidebar_collapsed = on,
@@ -12950,24 +12468,6 @@ fn main() {
         }
         return;
     }
-    // Hidden check: `shuffle --pdf-bench <file> [page]` renders one PDF page
-    // through the inspector-pager pipeline and prints the result, then exits.
-    if args.len() >= 3 && args[1] == "--pdf-bench" {
-        let path = PathBuf::from(&args[2]);
-        let page: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let t0 = std::time::Instant::now();
-        match render_pdf_page(&path, page) {
-            Some((_, count)) => eprintln!(
-                "ok: rendered page {} of {} in {} ms",
-                page + 1,
-                count,
-                t0.elapsed().as_millis()
-            ),
-            None => eprintln!("failed to render {}", path.display()),
-        }
-        return;
-    }
-
     // Synthetic, disk-free validation of typo ranking.
     if args.len() >= 2 && args[1] == "--typo-test" {
         let mk = |p: &str, is_dir: bool| {
@@ -13086,7 +12586,7 @@ fn main() {
         set_active_theme(saved_theme);
         cx.set_global(ThemeGlobal(saved_theme));
 
-        // Load feature prefs (terminal / preview / info), all off by default.
+        // Load feature prefs (terminal / info), all off by default.
         let saved_prefs = load_prefs();
         set_active_prefs(saved_prefs);
         cx.set_global(PrefsGlobal(saved_prefs));
