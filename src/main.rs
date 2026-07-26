@@ -35,7 +35,14 @@ use objc2_app_kit::{
     NSDraggingSession, NSDraggingSource, NSDragOperation, NSGraphicsContext, NSImage,
     NSPDFImageRep, NSWorkspace,
 };
-use objc2_foundation::{NSData, NSFileManager, NSObject, NSString, NSURL};
+use objc2_core_foundation::{CFArray, CFRetained, CFType};
+use objc2_core_services::{
+    kLSSharedFileListDoNotMountVolumes, kLSSharedFileListNoUserInteraction, LSSharedFileList,
+    LSSharedFileListItem,
+};
+use objc2_foundation::{
+    NSData, NSFileManager, NSObject, NSString, NSURL, NSURLBookmarkResolutionOptions,
+};
 use rayon::prelude::*;
 
 const RECENTS_CAP: usize = 12;
@@ -2369,6 +2376,13 @@ struct Group {
     paths: Vec<PathBuf>,
 }
 
+/// A filesystem-backed item from Finder's Favorites sidebar.
+#[derive(Clone, PartialEq)]
+struct FinderFavorite {
+    label: String,
+    path: PathBuf,
+}
+
 /// What a right-click in the sidebar targeted (drives its context menu).
 #[derive(Clone)]
 enum SidebarTarget {
@@ -2620,6 +2634,7 @@ struct Shuffle {
     fade_ticker: bool,
     recents: Vec<PathBuf>,
     bookmarks: Vec<PathBuf>,
+    finder_favorites: Vec<FinderFavorite>,
     /// User-defined sidebar groups (when the feature is enabled).
     groups: Vec<Group>,
     /// Open sidebar context menu: (x, y, what was clicked).
@@ -2724,10 +2739,19 @@ enum UpdateStatus {
 }
 
 impl Shuffle {
-    fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
+    fn new(dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let finder_favorites = read_finder_favorites();
         ensure_base_icons(); // real folder/file icons ready before first render
-        ensure_sidebar_icons(); // Applications/Documents/… + Mac/home icons
+        ensure_sidebar_icons(); // Mac/home icons
+        ensure_finder_favorite_icons(&finder_favorites);
         ensure_dynamic_sidebar_icons(); // cloud providers + mounted volumes
+        // Finder Favorites can change while Shuffle is in the background.
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.refresh_finder_favorites(cx);
+            }
+        })
+        .detach();
         // Sync + repaint whenever the theme changes (e.g. from Settings).
         cx.observe_global::<ThemeGlobal>(|_, cx| {
             set_active_theme(cx.global::<ThemeGlobal>().0);
@@ -2827,6 +2851,7 @@ impl Shuffle {
             clear_icon_cache();
             ensure_base_icons();
             ensure_sidebar_icons();
+            ensure_finder_favorite_icons(&this.finder_favorites);
             ensure_dynamic_sidebar_icons();
             cx.notify();
             this.prewarm_icons(cx);
@@ -2842,6 +2867,7 @@ impl Shuffle {
             fade_ticker: false,
             recents: read_path_list("recents.txt"),
             bookmarks: read_path_list("bookmarks.txt"),
+            finder_favorites,
             groups: load_groups(),
             sidebar_menu: None,
             group_dialog: None,
@@ -2902,6 +2928,15 @@ impl Shuffle {
 
     fn active_tab(&self) -> &Tab {
         self.tab(self.active_pane)
+    }
+
+    fn refresh_finder_favorites(&mut self, cx: &mut Context<Self>) {
+        let favorites = read_finder_favorites();
+        if favorites != self.finder_favorites {
+            ensure_finder_favorite_icons(&favorites);
+            self.finder_favorites = favorites;
+            cx.notify();
+        }
     }
 
     // ----- right-click context menu -----
@@ -8073,20 +8108,22 @@ impl Shuffle {
                 .into_any_element(),
         );
 
-        // --- Favorites (Applications, Documents, …) ---
+        // --- Finder Favorites ---
         if self.begin_section(&mut items, "FAVORITES", collapsed, cx) {
-            for (label, slug) in SIDEBAR_FAVORITES {
-                let path = fav_path(slug);
-                if !cached_is_dir(&path) {
+            if self.finder_favorites.is_empty() && !collapsed {
+                items.push(empty_hint("No Finder favorites").into_any_element());
+            }
+            for favorite in &self.finder_favorites {
+                if !cached_is_dir(&favorite.path) {
                     continue;
                 }
                 push_nav(
                     &mut items,
                     cx,
                     &mut key,
-                    label.to_string(),
-                    fav_key(slug),
-                    path,
+                    favorite.label.clone(),
+                    favorite.path.to_string_lossy().into_owned(),
+                    favorite.path.clone(),
                     current,
                     collapsed,
                 );
@@ -10645,33 +10682,12 @@ fn ensure_base_icons() {
     }
 }
 
-/// The favorite/location shortcuts shown at the top of the sidebar. Each is
-/// `(label, slug)`; the slug both names the cache key (`fav:<slug>`) and the
-/// pack override file (`<slug>.png`). The real path is resolved by [`fav_path`].
-const SIDEBAR_FAVORITES: &[(&str, &str)] = &[
-    ("Applications", "applications"),
-    ("Desktop", "desktop"),
-    ("Documents", "documents"),
-    ("Downloads", "downloads"),
-    ("Pictures", "pictures"),
-    ("Music", "music"),
-    ("Movies", "movies"),
-];
-
-/// The path a favorite/location slug points at (used for navigation and to fetch
-/// the real macOS special-folder icon when no pack overrides it).
+/// The path a built-in location slug points at.
 fn fav_path(slug: &str) -> PathBuf {
     let home = home_dir();
     match slug {
-        "applications" => PathBuf::from("/Applications"),
         "computer" => PathBuf::from("/"),
         "home" => home,
-        "desktop" => home.join("Desktop"),
-        "documents" => home.join("Documents"),
-        "downloads" => home.join("Downloads"),
-        "pictures" => home.join("Pictures"),
-        "music" => home.join("Music"),
-        "movies" => home.join("Movies"),
         other => home.join(other),
     }
 }
@@ -10680,15 +10696,9 @@ fn fav_key(slug: &str) -> String {
     format!("fav:{slug}")
 }
 
-/// Build the special sidebar icons (Applications, Documents, the Mac, home, …)
-/// synchronously. There are only a handful and each is a few ms, so this is fine
-/// at startup and on icon-pack changes. A pack override (`<slug>.png`) wins;
-/// otherwise we use the real macOS special-folder icon for that path.
+/// Build the built-in location icons synchronously.
 fn ensure_sidebar_icons() {
-    let mut slugs: Vec<&str> = SIDEBAR_FAVORITES.iter().map(|(_, s)| *s).collect();
-    slugs.push("home");
-    slugs.push("computer");
-    for slug in slugs {
+    for slug in ["home", "computer"] {
         let key = fav_key(slug);
         if ICON_CACHE.with(|c| c.borrow().contains_key(&key)) {
             continue;
@@ -10696,6 +10706,92 @@ fn ensure_sidebar_icons() {
         let icon = pack_icon_path(&key)
             .and_then(|p| decode_image_file(&p))
             .or_else(|| build_macos_icon(&fav_path(slug)));
+        ICON_CACHE.with(|c| {
+            c.borrow_mut().insert(key, icon);
+        });
+    }
+}
+
+/// Read Finder's Favorites SharedFileList in its display order. Finder also
+/// has virtual sidebar rows (for example AirDrop and Recents); only entries
+/// that resolve to filesystem URLs can be shown as navigable Shuffle rows.
+#[allow(deprecated)]
+fn read_finder_favorites() -> Vec<FinderFavorite> {
+    let mut favorites = Vec::new();
+    let mut seen = HashSet::new();
+
+    // SAFETY: Passed references live for each CoreServices call, null pointers
+    // are optional out-parameters, and objc2 retains all returned CF objects.
+    unsafe {
+        let Some(list) = LSSharedFileList::new(
+            None,
+            objc2_core_services::kLSSharedFileListFavoriteItems,
+            None,
+        ) else {
+            return favorites;
+        };
+        let Some(snapshot) = list.snapshot(std::ptr::null_mut()) else {
+            return favorites;
+        };
+        // LSSharedFileListCopySnapshot is declared as an untyped CFArray. Its
+        // documented contents are LSSharedFileListItem CoreFoundation objects.
+        let snapshot = CFRetained::cast_unchecked::<CFArray<CFType>>(snapshot);
+
+        for value in snapshot.iter() {
+            let Ok(item) = value.downcast::<LSSharedFileListItem>() else {
+                continue;
+            };
+            let flags =
+                kLSSharedFileListNoUserInteraction | kLSSharedFileListDoNotMountVolumes;
+            let Some(url) = item.resolved_url(flags, std::ptr::null_mut()) else {
+                continue;
+            };
+            let Some(path) = url.to_file_path() else {
+                continue;
+            };
+            let path = resolve_macos_alias(&path);
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+
+            let label = item.display_name().to_string();
+            let label = if label.is_empty() {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            } else {
+                label
+            };
+            favorites.push(FinderFavorite { label, path });
+        }
+    }
+
+    favorites
+}
+
+/// Resolve a Finder alias file to its target without showing UI or mounting
+/// disconnected volumes. Ordinary paths are returned unchanged.
+fn resolve_macos_alias(path: &Path) -> PathBuf {
+    let path_string = path.to_string_lossy();
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path_string));
+    let options =
+        NSURLBookmarkResolutionOptions::WithoutUI | NSURLBookmarkResolutionOptions::WithoutMounting;
+
+    NSURL::URLByResolvingAliasFileAtURL_options_error(&url, options)
+        .ok()
+        .and_then(|resolved| resolved.path())
+        .map(|resolved| PathBuf::from(resolved.to_string()))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// Cache Finder Favorites icons by path, matching dynamic location rows.
+fn ensure_finder_favorite_icons(favorites: &[FinderFavorite]) {
+    for favorite in favorites {
+        let key = favorite.path.to_string_lossy().into_owned();
+        if ICON_CACHE.with(|c| c.borrow().contains_key(&key)) {
+            continue;
+        }
+        let icon = build_macos_icon(&favorite.path);
         ICON_CACHE.with(|c| {
             c.borrow_mut().insert(key, icon);
         });
@@ -12897,7 +12993,7 @@ fn open_main_window(cx: &mut App) {
         },
         |window, cx| {
             let view = cx.new(|cx| {
-                let mut finder = Shuffle::new(load_last_dir(), cx);
+                let mut finder = Shuffle::new(load_last_dir(), window, cx);
                 finder.prewarm_icons(cx);
                 finder.build_index(cx);
                 // Quietly check GitHub for a newer release (shows a banner if so).

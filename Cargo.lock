@@ -3499,6 +3499,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-services"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "583300ad934cba24ff5292aee751ecc070f7ca6b39a574cc21b7b5e588e06a0b"
+dependencies = [
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "objc2-core-text"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4842,7 +4851,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shuffle"
-version = "0.2.4"
+version = "0.2.8"
 dependencies = [
  "chrono",
  "gpui",
@@ -4850,6 +4859,8 @@ dependencies = [
  "jwalk",
  "objc2",
  "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-services",
  "objc2-foundation",
  "raw-window-handle",
  "rayon",
