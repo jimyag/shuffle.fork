@@ -1,3 +1,4 @@
 /target
+*.dmg
 **/*.rs.bk
 .DS_Store
