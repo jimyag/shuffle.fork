@@ -11795,20 +11795,6 @@ fn config_file(name: &str) -> Option<PathBuf> {
     Some(config_dir()?.join(name))
 }
 
-/// The directory to open on launch: the last-visited one if still valid,
-/// otherwise the home directory.
-fn load_last_dir() -> PathBuf {
-    if let Some(path) = config_file("last_dir.txt") {
-        if let Ok(saved) = fs::read_to_string(&path) {
-            let dir = PathBuf::from(saved.trim());
-            if dir.is_dir() {
-                return dir;
-            }
-        }
-    }
-    home_dir()
-}
-
 fn save_last_dir(dir: &Path) {
     if let Some(path) = config_file("last_dir.txt") {
         if let Some(parent) = path.parent() {
@@ -11818,7 +11804,8 @@ fn save_last_dir(dir: &Path) {
     }
 }
 
-/// Read a newline-separated list of paths, keeping only ones that still exist.
+/// Read saved paths without touching their targets. Stale or protected entries
+/// are handled only when the user activates them.
 fn read_path_list(name: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(file) = config_file(name) {
@@ -11828,11 +11815,7 @@ fn read_path_list(name: &str) -> Vec<PathBuf> {
                 if line.is_empty() {
                     continue;
                 }
-                let path = PathBuf::from(line);
-                // Keep files too (bookmarks can be files); drop only stale paths.
-                if path.exists() {
-                    paths.push(path);
-                }
+                paths.push(PathBuf::from(line));
             }
         }
     }
@@ -12635,7 +12618,7 @@ fn open_main_window(cx: &mut App) {
         },
         |window, cx| {
             let view = cx.new(|cx| {
-                let mut finder = Shuffle::new(load_last_dir(), window, cx);
+                let mut finder = Shuffle::new(home_dir(), window, cx);
                 finder.prewarm_icons(cx);
                 // Quietly check GitHub for a newer release (shows a banner if so).
                 finder.check_for_update(cx);
