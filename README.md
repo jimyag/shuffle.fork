@@ -30,13 +30,13 @@ you move, and gives power users real tools instead of getting in the way.
   into two side by side panes, each with its own tabs, history, and filter, and a
   draggable divider resizes them.
 * 🗂️ **Tabs.** `Cmd+T` or `+`, with smooth drag to reorder and drag between panes.
-* ⚡ **Command palette (`Cmd+P`).** Millisecond fuzzy search over your home
-  directory with typo tolerance, live path browsing, and quick commands.
+* 🔎 **Unified search (`Cmd+P`, `/`, or the toolbar magnifier).** Switch between
+  direct children of the current folder, recursive folder search, and global
+  fuzzy search with typo tolerance, live path browsing, and quick commands.
 * ⌨️ **Terminal mode.** An optional command bar at the bottom to move through the
   explorer like a shell (`cd` navigates, Tab autocompletes paths and commands).
 * 👁️ **Preview and Information.** Single click a file to preview it (QuickLook:
   images, PDFs, docs) and inspect its details in a side inspector.
-* 🔎 **In-place filter (`/`).** Instantly narrow the current folder, typo tolerant.
 * ☁️ **Cloud and servers.** Dropbox, Google Drive, OneDrive, and iCloud show up
   automatically, alongside mounted volumes and a Connect to Server dialog.
 * 🎨 **Deep theming.** Dozens of preset palettes (Catppuccin, Dracula, Nord,
@@ -67,13 +67,13 @@ cargo build --release     # optimized
 
 ## Keyboard shortcuts
 
-| Shortcut | Action                       |
-| :------- | :--------------------------- |
-| `Cmd+P`  | Command palette / fuzzy find |
-| `/`      | Filter the current directory |
-| `Cmd+T`  | New tab                      |
-| `Cmd+W`  | Close tab                    |
-| `Cmd+,`  | Settings                     |
+| Shortcut | Action                            |
+| :------- | :-------------------------------- |
+| `Cmd+P`  | Open the unified search palette   |
+| `/`      | Open the unified search palette   |
+| `Cmd+T`  | New tab                           |
+| `Cmd+W`  | Close tab                         |
+| `Cmd+,`  | Settings                          |
 
 ## Roadmap — you pick what's next
 
