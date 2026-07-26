@@ -35,16 +35,18 @@ you move, and gives power users real tools instead of getting in the way.
   fuzzy search with typo tolerance, live path browsing, and quick commands.
 * ⌨️ **Terminal mode.** An optional command bar at the bottom to move through the
   explorer like a shell (`cd` navigates, Tab autocompletes paths and commands).
-* 👁️ **Preview and Information.** Single click a file to preview it (QuickLook:
-  images, PDFs, docs) and inspect its details in a side inspector.
+* 👁️ **Native Quick Look.** Select a file and press `Space` to preview it with
+  the system panel, including images, PDFs, documents, audio, and video.
+* ℹ️ **Information inspector.** Optionally show file details such as kind, size,
+  dates, dimensions, color space, and code signature.
 * ☁️ **Cloud and servers.** Dropbox, Google Drive, OneDrive, and iCloud show up
   automatically, alongside mounted volumes and a Connect to Server dialog.
 * 🎨 **Deep theming.** Dozens of preset palettes (Catppuccin, Dracula, Nord,
   Gruvbox, Solarized, Tokyo Night, and bold single hue themes) plus per color
   customization, applied live.
 
-Optional features (Terminal, Preview, Information) live in **Settings › General**
-and are off by default.
+Optional features (Terminal and Information) live in **Settings › General** and
+are off by default.
 
 ## Platform support
 
@@ -71,6 +73,7 @@ cargo build --release     # optimized
 | :------- | :-------------------------------- |
 | `Cmd+P`  | Open the unified search palette   |
 | `/`      | Open the unified search palette   |
+| `Space`  | Open or close native Quick Look   |
 | `Cmd+T`  | New tab                           |
 | `Cmd+W`  | Close tab                         |
 | `Cmd+,`  | Settings                          |
