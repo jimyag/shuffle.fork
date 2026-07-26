@@ -433,13 +433,9 @@ fn apply_icon_pack(p: Option<PathBuf>, cx: &mut App) {
 
 // ----- menu style (right-click / dropdown menu appearance) -------------------
 
-/// Customizable look of pop-up menus (right-click menu, dropdowns).
+/// Customizable sizing of pop-up menus. Menu colors come from the active theme.
 #[derive(Clone, Copy, PartialEq)]
 struct MenuStyle {
-    /// Menu background color.
-    bg: u32,
-    /// Menu text ("letter") color.
-    text: u32,
     /// Background opacity, 0..=100 percent.
     opacity: u8,
     /// Menu font size in pixels.
@@ -448,16 +444,15 @@ struct MenuStyle {
 
 impl Default for MenuStyle {
     fn default() -> Self {
-        let d = Theme::default();
-        MenuStyle { bg: d.surface, text: d.text, opacity: 100, font_px: 14.0 }
+        MenuStyle { opacity: 100, font_px: 14.0 }
     }
 }
 
 impl MenuStyle {
-    /// The background as an rgba value with the configured opacity applied.
+    /// The active theme surface with the configured opacity applied.
     fn bg_rgba(&self) -> Rgba {
         let a = (self.opacity.min(100) as u32 * 255) / 100;
-        Theme::alpha(self.bg, a)
+        Theme::alpha(theme().surface, a)
     }
 }
 
@@ -933,8 +928,6 @@ enum ColorTarget {
     Bg,
     Text,
     Hover,
-    MenuBg,
-    MenuText,
 }
 
 /// The Settings window: a tabbed customization surface.
@@ -1023,16 +1016,6 @@ impl Settings {
                                 let mut nt = theme();
                                 nt.hover = c;
                                 apply_theme(nt, cx);
-                            }
-                            ColorTarget::MenuBg => {
-                                let mut nm = menu_style();
-                                nm.bg = c;
-                                apply_menu_style(nm, cx);
-                            }
-                            ColorTarget::MenuText => {
-                                let mut nm = menu_style();
-                                nm.text = c;
-                                apply_menu_style(nm, cx);
                             }
                         }
                     }
@@ -1364,7 +1347,7 @@ impl Settings {
                             .rounded_md()
                             .cursor_pointer()
                             .bg(if avail { rgb(t.accent) } else { rgb(t.surface) })
-                            .text_color(if avail { rgb(0xffffff) } else { rgb(t.text) })
+                            .text_color(if avail { rgb(t.bg) } else { rgb(t.text) })
                             .hover(|s| s.bg(rgb(t.hover)))
                             .active(|s| s.bg(rgb(t.selected)))
                             .child(label)
@@ -1579,22 +1562,10 @@ impl Settings {
             )
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(menu_label("Menu color"))
-                    .child(self.hex_field(ColorTarget::MenuBg, menu_style().bg, cx)),
+                    .text_xs()
+                    .text_color(rgb(t.text_dim))
+                    .child("Menu colors follow the active theme."),
             )
-            .child(self.menu_color_row("menubg", menu_style().bg, |m, c| m.bg = c, cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(menu_label("Letter color"))
-                    .child(self.hex_field(ColorTarget::MenuText, menu_style().text, cx)),
-            )
-            .child(self.menu_color_row("menutext", menu_style().text, |m, c| m.text = c, cx))
             .child(stepper_row(
                 "st-menu-opacity",
                 "Opacity",
@@ -1824,41 +1795,6 @@ impl Settings {
         div().flex().flex_wrap().gap_1().children(swatches)
     }
 
-    /// Like [`color_row`] but sets a field on the menu style.
-    fn menu_color_row(
-        &self,
-        tag: &'static str,
-        current: u32,
-        set: fn(&mut MenuStyle, u32),
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let t = theme();
-        let mut swatches: Vec<AnyElement> = Vec::new();
-        for c in palette_colors() {
-            let selected = c == current;
-            swatches.push(
-                div()
-                    .id((tag, c as usize))
-                    .w(px(22.0))
-                    .h(px(22.0))
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(rgb(c))
-                    .border_2()
-                    .border_color(if selected { rgb(t.accent) } else { rgb(t.border) })
-                    .hover(|s| s.border_color(rgb(t.accent)))
-                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
-                        let mut nm = menu_style();
-                        set(&mut nm, c);
-                        apply_menu_style(nm, cx);
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-        }
-        div().flex().flex_wrap().gap_1().children(swatches)
-    }
-
     /// A live sample pop-up menu showing the current menu style.
     fn menu_preview(&self) -> impl IntoElement {
         let m = menu_style();
@@ -1875,7 +1811,7 @@ impl Settings {
             .min_w(px(200.0))
             .py_1()
             .bg(m.bg_rgba())
-            .text_color(rgb(m.text))
+            .text_color(rgb(t.text))
             .text_size(px(m.font_px))
             .rounded_md()
             .border_1()
@@ -2039,11 +1975,6 @@ fn settings_title(text: &str) -> impl IntoElement {
         .child(text.to_uppercase())
 }
 
-/// A small settings sub-label (normal case, not uppercased).
-fn menu_label(text: &str) -> impl IntoElement {
-    div().text_color(rgb(theme().text)).child(text.to_string())
-}
-
 /// A "Reset to Default" button (used once per settings tab).
 fn reset_button(
     id: &'static str,
@@ -2089,7 +2020,7 @@ fn toggle_row(
         .w(px(16.0))
         .h(px(16.0))
         .rounded_full()
-        .bg(rgb(0xffffff));
+        .bg(rgb(t.bg));
     let switch = div()
         .id(id)
         .flex_none()
@@ -4061,7 +3992,7 @@ impl Shuffle {
                             .min_w(px(200.0))
                             .py_1()
                             .bg(menu_style().bg_rgba())
-                            .text_color(rgb(menu_style().text))
+                            .text_color(rgb(theme().text))
                             .text_size(px(menu_style().font_px))
                             .rounded_md()
                             .border_1()
@@ -4174,7 +4105,7 @@ impl Shuffle {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x00000066))
+            .bg(Theme::alpha(t.bg, 0xb3))
             .occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.confirm_delete = None;
@@ -4352,7 +4283,7 @@ impl Shuffle {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x00000066))
+            .bg(Theme::alpha(t.bg, 0xb3))
             .occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.server_dialog = None;
@@ -4420,7 +4351,7 @@ impl Shuffle {
                                     .py_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .text_color(rgb(0xffffff))
+                                    .text_color(rgb(t.bg))
                                     .bg(rgb(t.accent))
                                     .hover(|s| s.bg(Theme::alpha(t.accent, 0xdd)))
                                     .child("Connect")
@@ -4450,7 +4381,7 @@ impl Shuffle {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x00000066))
+            .bg(Theme::alpha(t.bg, 0xb3))
             .occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                 this.group_dialog = None;
@@ -4511,7 +4442,7 @@ impl Shuffle {
                                     .py_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .text_color(rgb(0xffffff))
+                                    .text_color(rgb(t.bg))
                                     .bg(rgb(t.accent))
                                     .hover(|s| s.bg(Theme::alpha(t.accent, 0xdd)))
                                     .child("Create")
@@ -4599,7 +4530,7 @@ impl Shuffle {
                         .min_w(px(180.0))
                         .py_1()
                         .bg(menu_style().bg_rgba())
-                        .text_color(rgb(menu_style().text))
+                        .text_color(rgb(theme().text))
                         .text_size(px(menu_style().font_px))
                         .rounded_md()
                         .border_1()
@@ -4722,7 +4653,7 @@ impl Shuffle {
             .px_4()
             .py_1p5()
             .bg(rgb(t.accent))
-            .text_color(rgb(0xffffff))
+            .text_color(rgb(t.bg))
             .text_xs();
 
         let bar = match status {
@@ -4738,9 +4669,9 @@ impl Shuffle {
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgba(0xffffff33))
+                        .bg(Theme::alpha(t.bg, 0x33))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgba(0xffffff55)))
+                        .hover(|s| s.bg(Theme::alpha(t.bg, 0x55)))
                         .child("Update")
                         .on_mouse_down(
                             MouseButton::Left,
@@ -4754,7 +4685,7 @@ impl Shuffle {
                         .py_1()
                         .rounded_md()
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgba(0xffffff33)))
+                        .hover(|s| s.bg(Theme::alpha(t.bg, 0x33)))
                         .child("✕")
                         .on_mouse_down(
                             MouseButton::Left,
@@ -4775,9 +4706,9 @@ impl Shuffle {
                         .px_3()
                         .py_1()
                         .rounded_md()
-                        .bg(rgba(0xffffff33))
+                        .bg(Theme::alpha(t.bg, 0x33))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgba(0xffffff55)))
+                        .hover(|s| s.bg(Theme::alpha(t.bg, 0x55)))
                         .child("Download manually")
                         .on_mouse_down(
                             MouseButton::Left,
@@ -4795,7 +4726,7 @@ impl Shuffle {
                         .py_1()
                         .rounded_md()
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgba(0xffffff33)))
+                        .hover(|s| s.bg(Theme::alpha(t.bg, 0x33)))
                         .child("✕")
                         .on_mouse_down(
                             MouseButton::Left,
@@ -5046,7 +4977,7 @@ impl Shuffle {
                 .w(px(6.0))
                 .h(px(thumb_h))
                 .rounded_full()
-                .bg(rgba(0xffffff44))
+                .bg(Theme::alpha(theme().text, 0x44))
                 .into_any_element(),
         )
     }
@@ -5834,7 +5765,7 @@ impl Shuffle {
             // Align to top so the panel hugs its content height instead of
             // stretching to fill the whole window.
             .items_start()
-            .bg(rgba(0x00000033))
+            .bg(Theme::alpha(t.bg, 0x99))
             // Block scroll/click from reaching the file list behind the palette.
             .occlude()
             .child(wrap)
@@ -5865,9 +5796,9 @@ impl Shuffle {
             return None;
         }
         let color = if dragging {
-            rgba(0xffffff66)
+            Theme::alpha(theme().text, 0x66)
         } else {
-            rgba(0xffffff33)
+            Theme::alpha(theme().text, 0x33)
         };
 
         let thumb = div()
@@ -5880,7 +5811,7 @@ impl Shuffle {
             .rounded_full()
             .bg(color)
             .cursor(CursorStyle::PointingHand)
-            .hover(|s| s.bg(rgba(0xffffff55)))
+            .hover(|s| s.bg(Theme::alpha(theme().text, 0x55)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
@@ -9425,7 +9356,7 @@ impl Shuffle {
                 .h(px(8.0))
                 .w(px(thumb_w))
                 .rounded_full()
-                .bg(rgba(0xffffff33))
+                .bg(Theme::alpha(theme().text, 0x33))
                 .into_any_element(),
         )
     }
@@ -9946,7 +9877,7 @@ fn ctx_item(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .text_color(rgb(menu_style().text))
+        .text_color(rgb(theme().text))
         .hover(|s| s.bg(rgb(theme().selected)))
         .child(label)
         .on_click(on_click)
@@ -9973,7 +9904,7 @@ fn ctx_parent(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .text_color(rgb(menu_style().text))
+        .text_color(rgb(t.text))
         .hover(|s| s.bg(rgb(t.selected)))
         .child(label)
         .child(div().flex_none().text_color(rgb(t.text_dim)).child("›"))
@@ -9995,7 +9926,7 @@ fn ctx_app(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .text_color(rgb(menu_style().text))
+        .text_color(rgb(theme().text))
         .hover(|s| s.bg(rgb(theme().selected)))
         .child(name)
         .on_click(on_click)
@@ -12560,10 +12491,7 @@ fn save_menu_style(m: &MenuStyle) {
         if let Some(parent) = file.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let body = format!(
-            "bg={:06x}\ntext={:06x}\nopacity={}\nfont_px={}\n",
-            m.bg, m.text, m.opacity, m.font_px
-        );
+        let body = format!("opacity={}\nfont_px={}\n", m.opacity, m.font_px);
         let _ = fs::write(&file, body);
     }
 }
@@ -12579,16 +12507,6 @@ fn load_menu_style() -> MenuStyle {
                 };
                 let (k, v) = (k.trim(), v.trim());
                 match k {
-                    "bg" => {
-                        if let Ok(c) = u32::from_str_radix(v, 16) {
-                            m.bg = c;
-                        }
-                    }
-                    "text" => {
-                        if let Ok(c) = u32::from_str_radix(v, 16) {
-                            m.text = c;
-                        }
-                    }
                     "opacity" => {
                         if let Ok(n) = v.parse::<u8>() {
                             m.opacity = n.min(100);
