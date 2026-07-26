@@ -30,11 +30,11 @@ use gpui::{
     UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use objc2::runtime::NSObjectProtocol;
-use objc2::{define_class, AllocAnyThread, MainThreadOnly};
+use objc2::{define_class, AllocAnyThread, ClassType, MainThreadOnly};
 use objc2_app_kit::{
     NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSDraggingContext,
     NSDraggingSession, NSDraggingSource, NSDragOperation, NSGraphicsContext, NSImage,
-    NSWorkspace,
+    NSPasteboard, NSWorkspace,
 };
 use objc2_core_foundation::{CFArray, CFRetained, CFType};
 use objc2_core_services::{
@@ -42,7 +42,7 @@ use objc2_core_services::{
     LSSharedFileListItem,
 };
 use objc2_foundation::{
-    NSData, NSFileManager, NSObject, NSString, NSURL, NSURLBookmarkResolutionOptions,
+    NSArray, NSData, NSFileManager, NSObject, NSString, NSURL, NSURLBookmarkResolutionOptions,
 };
 use rayon::prelude::*;
 use quicklook::{PreviewItem, QuickLookPanel};
@@ -667,6 +667,9 @@ enum KeyAction {
     NewFile,
     NewFolder,
     Rename,
+    Copy,
+    Cut,
+    Paste,
     CopyPath,
     Duplicate,
     MakeAlias,
@@ -694,6 +697,9 @@ impl KeyAction {
         KeyAction::NewFile,
         KeyAction::NewFolder,
         KeyAction::Rename,
+        KeyAction::Copy,
+        KeyAction::Cut,
+        KeyAction::Paste,
         KeyAction::CopyPath,
         KeyAction::Duplicate,
         KeyAction::MakeAlias,
@@ -738,6 +744,9 @@ impl KeyAction {
             KeyAction::NewFile => "new_file",
             KeyAction::NewFolder => "new_folder",
             KeyAction::Rename => "rename",
+            KeyAction::Copy => "copy",
+            KeyAction::Cut => "cut",
+            KeyAction::Paste => "paste",
             KeyAction::CopyPath => "copy_path",
             KeyAction::Duplicate => "duplicate",
             KeyAction::MakeAlias => "make_alias",
@@ -765,6 +774,9 @@ impl KeyAction {
             KeyAction::NewFile => "New file",
             KeyAction::NewFolder => "New folder",
             KeyAction::Rename => "Rename",
+            KeyAction::Copy => "Copy",
+            KeyAction::Cut => "Cut",
+            KeyAction::Paste => "Paste",
             KeyAction::CopyPath => "Copy path",
             KeyAction::Duplicate => "Duplicate",
             KeyAction::MakeAlias => "Make alias",
@@ -789,6 +801,9 @@ impl KeyAction {
             KeyAction::CloseTab => Some("cmd-w"),
             KeyAction::Find => Some("/"),
             KeyAction::SelectAll => Some("cmd-a"),
+            KeyAction::Copy => Some("cmd-c"),
+            KeyAction::Cut => Some("cmd-x"),
+            KeyAction::Paste => Some("cmd-v"),
             KeyAction::PaletteCursorStart => Some("cmd-left"),
             KeyAction::PaletteCursorEnd => Some("cmd-right"),
             KeyAction::PaletteSelectAll => Some("cmd-a"),
@@ -2253,6 +2268,33 @@ struct Rename {
     anchor: Option<usize>,
 }
 
+#[derive(Clone)]
+struct FileClipboard {
+    paths: Vec<PathBuf>,
+    cut: bool,
+    pasteboard_change: isize,
+}
+
+#[derive(Clone)]
+struct PasteRequest {
+    paths: Vec<PathBuf>,
+    destination: PathBuf,
+    cut: bool,
+    pasteboard_change: isize,
+}
+
+#[derive(Clone, Copy)]
+enum ConflictChoice {
+    Replace,
+    KeepBoth,
+    Skip,
+}
+
+struct PasteResult {
+    completed: usize,
+    errors: Vec<String>,
+}
+
 /// The current level shown in the context menu.
 #[derive(Clone, Copy, PartialEq)]
 enum MenuView {
@@ -2571,6 +2613,9 @@ struct Shuffle {
     sort_menu: Option<(usize, f32, f32)>,
     /// Pending "move to Trash" confirmation: (pane, paths).
     confirm_delete: Option<(usize, Vec<PathBuf>)>,
+    file_clipboard: Option<FileClipboard>,
+    paste_conflict: Option<PasteRequest>,
+    file_operation_running: bool,
     /// Monotonic counter tagging each directory load (for stale-result guards).
     next_load_gen: u64,
     /// In-progress marquee (box) selection: (pane, start, current) window coords.
@@ -2789,6 +2834,9 @@ impl Shuffle {
             rename: None,
             sort_menu: None,
             confirm_delete: None,
+            file_clipboard: None,
+            paste_conflict: None,
+            file_operation_running: false,
             next_load_gen: 0,
             marquee: None,
             drag_candidate: None,
@@ -3014,6 +3062,254 @@ impl Shuffle {
         self.active_pane = pane;
         self.tab_mut(pane).view = mode;
         cx.notify();
+    }
+
+    fn selected_paths(&self, pane: usize) -> Vec<PathBuf> {
+        let tab = self.tab(pane);
+        let mut paths: Vec<PathBuf> = tab.selection.iter().cloned().collect();
+        if paths.is_empty() {
+            if let Some(path) = tab.anchor.clone() {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    fn copy_paths(&mut self, paths: Vec<PathBuf>, cut: bool, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            self.show_notice("Select at least one item first".to_string(), true, cx);
+            return;
+        }
+        let Some(change) = write_file_clipboard(&paths) else {
+            self.show_notice("Couldn’t write files to the clipboard".to_string(), true, cx);
+            return;
+        };
+        let count = paths.len();
+        self.file_clipboard = Some(FileClipboard {
+            paths,
+            cut,
+            pasteboard_change: change,
+        });
+        self.show_notice(
+            format!(
+                "{} {} item{}",
+                if cut { "Cut" } else { "Copied" },
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            false,
+            cx,
+        );
+    }
+
+    fn copy_selection(&mut self, cut: bool, cx: &mut Context<Self>) {
+        self.copy_paths(self.selected_paths(self.active_pane), cut, cx);
+    }
+
+    fn paste_into_active_folder(&mut self, cx: &mut Context<Self>) {
+        if self.file_operation_running {
+            self.show_notice("Another file operation is still running".to_string(), true, cx);
+            return;
+        }
+
+        let pasteboard_change = NSPasteboard::generalPasteboard().changeCount();
+        let (paths, cut) = match self
+            .file_clipboard
+            .as_ref()
+            .filter(|clipboard| clipboard.pasteboard_change == pasteboard_change)
+        {
+            Some(clipboard) => (clipboard.paths.clone(), clipboard.cut),
+            None => (read_file_clipboard(), false),
+        };
+        if paths.is_empty() {
+            self.show_notice("The clipboard doesn’t contain files".to_string(), true, cx);
+            return;
+        }
+
+        let request = PasteRequest {
+            paths,
+            destination: self.active_tab().current_dir.clone(),
+            cut,
+            pasteboard_change,
+        };
+        let has_conflicts = request.paths.iter().any(|source| {
+            source
+                .file_name()
+                .is_some_and(|name| request.destination.join(name).exists())
+                && source.parent() != Some(request.destination.as_path())
+        });
+        if has_conflicts {
+            self.paste_conflict = Some(request);
+            cx.notify();
+        } else {
+            self.start_paste(request, ConflictChoice::KeepBoth, cx);
+        }
+    }
+
+    fn resolve_paste_conflict(&mut self, choice: ConflictChoice, cx: &mut Context<Self>) {
+        if let Some(request) = self.paste_conflict.take() {
+            self.start_paste(request, choice, cx);
+        }
+    }
+
+    fn start_paste(
+        &mut self,
+        request: PasteRequest,
+        choice: ConflictChoice,
+        cx: &mut Context<Self>,
+    ) {
+        let pane = self.active_pane;
+        let cut = request.cut;
+        let pasteboard_change = request.pasteboard_change;
+        let count = request.paths.len();
+        self.file_operation_running = true;
+        self.show_notice(
+            format!(
+                "{} {} item{}…",
+                if cut { "Moving" } else { "Copying" },
+                count,
+                if count == 1 { "" } else { "s" }
+            ),
+            false,
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { perform_paste(request, choice) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.file_operation_running = false;
+                if cut {
+                    this.file_clipboard = None;
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    if pasteboard.changeCount() == pasteboard_change {
+                        pasteboard.clearContents();
+                    }
+                }
+                if pane < this.panes.len() {
+                    this.refresh_all_panes(cx);
+                }
+                if result.errors.is_empty() {
+                    this.show_notice(
+                        format!(
+                            "{} {} item{}",
+                            if cut { "Moved" } else { "Copied" },
+                            result.completed,
+                            if result.completed == 1 { "" } else { "s" }
+                        ),
+                        false,
+                        cx,
+                    );
+                } else {
+                    this.show_notice(result.errors.join(" · "), true, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn render_paste_conflict(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let request = self.paste_conflict.as_ref().expect("only when open");
+        let conflicts = request
+            .paths
+            .iter()
+            .filter(|source| {
+                source
+                    .file_name()
+                    .is_some_and(|name| request.destination.join(name).exists())
+            })
+            .count();
+
+        let button = |id: &'static str,
+                      label: &'static str,
+                      choice: ConflictChoice,
+                      cx: &Context<Self>| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(rgb(t.text))
+                .bg(rgb(t.hover))
+                .hover(|s| s.bg(rgb(t.selected)))
+                .child(label)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.resolve_paste_conflict(choice, cx);
+                }))
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Theme::alpha(t.bg, 0xb3))
+            .occlude()
+            .child(
+                div()
+                    .w(px(500.0))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .p_5()
+                    .rounded_lg()
+                    .bg(rgb(t.surface))
+                    .border_1()
+                    .border_color(rgb(t.border_strong))
+                    .shadow_lg()
+                    .child(div().text_color(rgb(t.text)).child(format!(
+                        "{} item{} already exist{} in this folder",
+                        conflicts,
+                        if conflicts == 1 { "" } else { "s" },
+                        if conflicts == 1 { "s" } else { "" }
+                    )))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(t.text_muted))
+                            .child("Choose one action for all conflicting items."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("paste-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(t.text))
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.paste_conflict = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(button("paste-skip", "Skip", ConflictChoice::Skip, cx))
+                            .child(button(
+                                "paste-keep-both",
+                                "Keep Both",
+                                ConflictChoice::KeepBoth,
+                                cx,
+                            ))
+                            .child(button(
+                                "paste-replace",
+                                "Replace",
+                                ConflictChoice::Replace,
+                                cx,
+                            )),
+                    ),
+            )
     }
 
     fn new_folder(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -3745,6 +4041,22 @@ impl Shuffle {
                 .into_any_element(),
             );
             let p = path.clone();
+            items.push(
+                ctx_item("Copy", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.close_context_menu(cx);
+                    this.copy_paths(vec![p.clone()], false, cx);
+                }))
+                .into_any_element(),
+            );
+            let p = path.clone();
+            items.push(
+                ctx_item("Cut", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.close_context_menu(cx);
+                    this.copy_paths(vec![p.clone()], true, cx);
+                }))
+                .into_any_element(),
+            );
+            let p = path.clone();
             let already = self.bookmarks.iter().any(|b| b == &p);
             items.push(
                 ctx_item(
@@ -3824,6 +4136,14 @@ impl Shuffle {
             );
             items.push(ctx_separator().into_any_element());
         }
+        items.push(
+            ctx_item("Paste", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.close_context_menu(cx);
+                this.paste_into_active_folder(cx);
+            }))
+            .into_any_element(),
+        );
+        items.push(ctx_separator().into_any_element());
         items.push(
             ctx_item("New Folder", cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.close_context_menu(cx);
@@ -5361,6 +5681,9 @@ impl Shuffle {
                     self.begin_rename(pane, p, window, cx);
                 }
             }
+            KeyAction::Copy => self.copy_selection(false, cx),
+            KeyAction::Cut => self.copy_selection(true, cx),
+            KeyAction::Paste => self.paste_into_active_folder(cx),
             KeyAction::CopyPath => {
                 if let Some(p) = anchor {
                     cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
@@ -5445,6 +5768,14 @@ impl Shuffle {
                     cx.notify();
                 }
                 _ => {}
+            }
+            return;
+        }
+
+        if self.paste_conflict.is_some() {
+            if key == "escape" {
+                self.paste_conflict = None;
+                cx.notify();
             }
             return;
         }
@@ -9571,6 +9902,9 @@ impl Render for Shuffle {
         if self.confirm_delete.is_some() {
             root = root.child(self.render_confirm_delete(cx));
         }
+        if self.paste_conflict.is_some() {
+            root = root.child(self.render_paste_conflict(cx));
+        }
         if self.server_dialog.is_some() {
             root = root.child(self.render_server_dialog(cx));
         }
@@ -10090,6 +10424,151 @@ fn apps_for_file(path: &Path) -> Vec<(String, PathBuf)> {
     }
     out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     out
+}
+
+/// Write file URLs to the system pasteboard and return its new change counter.
+fn write_file_clipboard(paths: &[PathBuf]) -> Option<isize> {
+    use objc2::runtime::ProtocolObject;
+    use objc2_app_kit::NSPasteboardWriting;
+
+    let writers: Vec<objc2::rc::Retained<ProtocolObject<dyn NSPasteboardWriting>>> = paths
+        .iter()
+        .filter_map(|path| {
+            let path = path.to_str()?;
+            let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+            Some(ProtocolObject::from_retained(url))
+        })
+        .collect();
+    if writers.is_empty() {
+        return None;
+    }
+
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    let objects = NSArray::from_retained_slice(&writers);
+    pasteboard
+        .writeObjects(&objects)
+        .then(|| pasteboard.changeCount())
+}
+
+fn read_file_clipboard() -> Vec<PathBuf> {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyClass;
+
+    let classes: Retained<NSArray<AnyClass>> = NSArray::from_slice(&[NSURL::class()]);
+    let Some(objects) = (unsafe {
+        NSPasteboard::generalPasteboard().readObjectsForClasses_options(&classes, None)
+    }) else {
+        return Vec::new();
+    };
+    // SAFETY: readObjectsForClasses was constrained to NSURL above.
+    let urls: Retained<NSArray<NSURL>> = unsafe { Retained::cast_unchecked(objects) };
+    urls.iter().filter_map(|url| url.to_file_path()).collect()
+}
+
+fn perform_paste(request: PasteRequest, choice: ConflictChoice) -> PasteResult {
+    let mut result = PasteResult {
+        completed: 0,
+        errors: Vec::new(),
+    };
+
+    for source in request.paths {
+        let Some(name) = source.file_name() else {
+            result
+                .errors
+                .push(format!("Invalid source path: {}", source.display()));
+            continue;
+        };
+        if !source.exists() {
+            result
+                .errors
+                .push(format!("“{}” is no longer available", path_label(&source)));
+            continue;
+        }
+        if request.destination.starts_with(&source) && request.destination != source {
+            result
+                .errors
+                .push(format!("Can’t place “{}” inside itself", path_label(&source)));
+            continue;
+        }
+
+        let mut destination = request.destination.join(name);
+        if source == destination {
+            if request.cut {
+                continue;
+            }
+            destination = unique_paste_destination(&request.destination, &source);
+        } else if destination.exists() {
+            match choice {
+                ConflictChoice::Skip => continue,
+                ConflictChoice::KeepBoth => {
+                    destination = unique_paste_destination(&request.destination, &source);
+                }
+                ConflictChoice::Replace => {
+                    if !trash_path(&destination) {
+                        result.errors.push(format!(
+                            "Couldn’t replace “{}”",
+                            path_label(&destination)
+                        ));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let output = if request.cut {
+            Command::new("mv").arg(&source).arg(&destination).output()
+        } else {
+            Command::new("ditto").arg(&source).arg(&destination).output()
+        };
+        match output {
+            Ok(output) if output.status.success() => result.completed += 1,
+            Ok(output) => {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                result.errors.push(if detail.is_empty() {
+                    format!(
+                        "{} failed for “{}”",
+                        if request.cut { "Move" } else { "Copy" },
+                        path_label(&source)
+                    )
+                } else {
+                    detail
+                });
+            }
+            Err(error) => result.errors.push(format!(
+                "{} failed for “{}”: {error}",
+                if request.cut { "Move" } else { "Copy" },
+                path_label(&source)
+            )),
+        }
+    }
+    result
+}
+
+fn unique_paste_destination(destination: &Path, source: &Path) -> PathBuf {
+    let stem = source
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "item".to_string());
+    let extension = source
+        .extension()
+        .map(|value| value.to_string_lossy().into_owned());
+    for number in 1usize.. {
+        let suffix = if number == 1 {
+            " copy".to_string()
+        } else {
+            format!(" copy {number}")
+        };
+        let name = match &extension {
+            Some(extension) => format!("{stem}{suffix}.{extension}"),
+            None => format!("{stem}{suffix}"),
+        };
+        let candidate = destination.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 /// A non-existing child path under `dir` based on `base` (adds " 2", " 3" …).
