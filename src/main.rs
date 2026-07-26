@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
+use dispatch2::DispatchQueue;
 use gpui::{
     actions, anchored, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size,
     uniform_list, Animation, AnimationExt, AnyElement, App,
@@ -5259,8 +5260,14 @@ impl Shuffle {
     fn toggle_quick_look(&self) {
         let pane = self.active_pane;
         let paths = self.display_paths(pane);
-        let focused = self.tab(pane).anchor.as_deref();
-        toggle_quick_look_panel(paths, focused);
+        let focused = self.tab(pane).anchor.clone();
+
+        // QLPreviewPanel runs a nested AppKit event loop while opening. Queue
+        // it after this GPUI key event so GPUI has released its app borrow
+        // before that nested loop dispatches another event.
+        DispatchQueue::main().exec_async(move || {
+            toggle_quick_look_panel(paths, focused.as_deref());
+        });
     }
 
     /// Top-level key handling: Cmd+P toggles; while open, drive the palette.

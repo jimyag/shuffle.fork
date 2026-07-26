@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 gpui = "0.2.2"
 chrono = "0.4"
+# Defer native panels until the current GPUI event has released its app borrow.
+dispatch2 = "0.3"
 # Parallel fuzzy scoring of the in-memory file index.
 rayon = "1"
 # Fast parallel directory walking for index builds.
