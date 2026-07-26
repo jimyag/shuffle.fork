@@ -1,4 +1,5 @@
 /target
+Shuffle.app/
 *.dmg
 **/*.rs.bk
 .DS_Store
