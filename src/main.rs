@@ -2385,10 +2385,6 @@ struct Tab {
     /// Back/forward navigation history and our position within it.
     history: Vec<PathBuf>,
     hist_pos: usize,
-    /// Deepest directory visited along the current lineage. When we move up to
-    /// an ancestor, the breadcrumb keeps showing this path's trailing segments
-    /// (grayed out) so the user can click forward into them again.
-    deepest: Option<PathBuf>,
     /// When `Some`, the path bar is an editable text field holding this string.
     editing_path: Option<String>,
     /// Text-cursor position (char index) within `editing_path`.
@@ -2442,7 +2438,6 @@ impl Tab {
             entries,
             history: vec![dir.clone()],
             hist_pos: 0,
-            deepest: Some(dir),
             editing_path: None,
             path_cursor: 0,
             path_anchor: None,
@@ -6108,19 +6103,13 @@ impl Shuffle {
     }
 
     /// Load `dir` as a pane's current directory: re-read contents, update the
-    /// breadcrumb's deepest-tail, record it as most-recent, and persist. Does
-    /// NOT touch back/forward history (callers manage that).
+    /// breadcrumb, record it as most-recent, and persist. Does NOT touch
+    /// back/forward history (callers manage that).
     fn load_dir_in(&mut self, pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
         self.rename = None;
         clear_column_cache();
         {
             let tab = self.tab_mut(pane);
-            // Keep the grayed-out forward tail in the breadcrumb when moving to an
-            // ancestor of where we were; otherwise the tail resets to here.
-            let keep = tab.deepest.as_ref().is_some_and(|d| d.starts_with(&dir));
-            if !keep {
-                tab.deepest = Some(dir.clone());
-            }
             tab.current_dir = dir.clone();
             tab.editing_path = None;
             tab.find_query = None;
@@ -8628,23 +8617,17 @@ impl Shuffle {
     }
 
     /// Clickable breadcrumb for a pane. Segments up to and including the current
-    /// directory are bright; any deeper "forward tail" is grayed but still
-    /// clickable. Empty space to the right enters edit mode.
+    /// directory are bright. Empty space to the right enters edit mode.
     fn render_breadcrumb(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
         use std::path::Component;
 
         let tab = self.tab(pane);
         let current_dir = tab.current_dir.clone();
-        // Show the deepest tail if the current dir is an ancestor of it.
-        let display = match &tab.deepest {
-            Some(d) if d.starts_with(&current_dir) => d.clone(),
-            _ => current_dir.clone(),
-        };
 
         let mut segs: Vec<AnyElement> = Vec::new();
         let mut acc = PathBuf::new();
         let mut idx = 0usize;
-        for comp in display.components() {
+        for comp in current_dir.components() {
             let (label, full) = match comp {
                 Component::RootDir => {
                     acc.push("/");
