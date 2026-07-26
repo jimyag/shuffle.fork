@@ -44,6 +44,7 @@ use objc2_foundation::{
     NSData, NSFileManager, NSObject, NSString, NSURL, NSURLBookmarkResolutionOptions,
 };
 use rayon::prelude::*;
+use quicklook::{PreviewItem, QuickLookPanel};
 
 const RECENTS_CAP: usize = 12;
 
@@ -5311,6 +5312,15 @@ impl Shuffle {
         }
     }
 
+    /// Show the active folder in the native Quick Look panel, starting at the
+    /// focused item so the panel's arrow keys can move through nearby files.
+    fn toggle_quick_look(&self) {
+        let pane = self.active_pane;
+        let paths = self.display_paths(pane);
+        let focused = self.tab(pane).anchor.as_deref();
+        toggle_quick_look_panel(paths, focused);
+    }
+
     /// Top-level key handling: Cmd+P toggles; while open, drive the palette.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
@@ -5382,6 +5392,10 @@ impl Shuffle {
             return;
         }
         if !self.palette_open {
+            if !cmd && key == "space" {
+                self.toggle_quick_look();
+                return;
+            }
             // Arrow keys move the selection within the active pane.
             if !cmd {
                 let pane = self.active_pane;
@@ -11137,6 +11151,44 @@ fn ensure_dynamic_sidebar_icons() {
             c.borrow_mut().insert(key, icon);
         });
     }
+}
+
+// ----- native Quick Look ----------------------------------------------------
+
+thread_local! {
+    /// Quick Look keeps unretained references to its data source and delegate,
+    /// so retain the wrapper for the lifetime of the main UI thread.
+    static QUICK_LOOK: RefCell<Option<QuickLookPanel>> = const { RefCell::new(None) };
+}
+
+fn toggle_quick_look_panel(paths: Vec<PathBuf>, focused: Option<&Path>) {
+    if paths.is_empty() {
+        return;
+    }
+    let current = focused
+        .and_then(|path| paths.iter().position(|candidate| candidate == path))
+        .unwrap_or(0);
+    let items: Vec<PreviewItem> = paths
+        .iter()
+        .filter_map(|path| PreviewItem::from_file_url(path, None))
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+
+    QUICK_LOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = QuickLookPanel::shared();
+        }
+        let Some(panel) = slot.as_ref() else {
+            return;
+        };
+        panel.set_items(items);
+        panel.reload_if_dirty();
+        panel.set_current_preview_item_index(current as _);
+        panel.toggle_visible();
+    });
 }
 
 // ----- native OS file drag-out (drag files into Finder / other apps) ---------

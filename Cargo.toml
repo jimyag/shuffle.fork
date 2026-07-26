@@ -20,6 +20,8 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-core-services = { version = "0.3", default-features = false, features = ["std", "SharedFileList", "LSSharedFileList"] }
 objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSError", "NSFileManager", "NSURL", "NSArray"] }
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPDFImageRep", "NSGraphics", "NSGraphicsContext", "NSResponder", "NSView", "NSEvent", "NSApplication", "NSPasteboard", "NSDragging", "NSDraggingItem", "NSDraggingSession"] }
+# Native macOS Quick Look panel shown with Space.
+quicklook = "0.2"
 # Reach the underlying NSView so we can start native OS drag sessions (drag files out to Finder/other apps).
 raw-window-handle = "0.6"
 
