@@ -339,8 +339,6 @@ struct Prefs {
     palette_history: bool,
     /// Enable custom sidebar "groups" of files/folders.
     groups_enabled: bool,
-    /// Show the always-on "Filter" pill in the bottom-right (/ still works).
-    show_filter_button: bool,
     /// Show a live frame-rate meter in the top-right (debug; costs some CPU).
     show_fps: bool,
 }
@@ -358,7 +356,6 @@ impl Default for Prefs {
             recent_limit: 3,
             palette_history: false,
             groups_enabled: false,
-            show_filter_button: true,
             show_fps: false,
         }
     }
@@ -380,7 +377,6 @@ thread_local! {
         recent_limit: 3,
         palette_history: false,
         groups_enabled: false,
-        show_filter_button: true,
         show_fps: false,
     }) };
 }
@@ -770,7 +766,7 @@ impl KeyAction {
             KeyAction::CommandPalette => "Command palette",
             KeyAction::NewTab => "New tab",
             KeyAction::CloseTab => "Close tab",
-            KeyAction::Find => "Filter current folder",
+            KeyAction::Find => "Search current folder",
             KeyAction::SelectAll => "Select all",
             KeyAction::NewFile => "New file",
             KeyAction::NewFolder => "New folder",
@@ -1247,19 +1243,6 @@ impl Settings {
                 cx.listener(|_, _: &ClickEvent, _, cx| {
                     let mut np = prefs();
                     np.groups_enabled = !np.groups_enabled;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-filter-button",
-                "Filter button",
-                "Show the always-on \"Filter\" button in the bottom-right corner. \
-                 Pressing / still opens the filter either way.",
-                p.show_filter_button,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.show_filter_button = !np.show_filter_button;
                     apply_prefs(np, cx);
                     cx.notify();
                 }),
@@ -2265,6 +2248,12 @@ enum Action {
     None,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PaletteMode {
+    Commands,
+    SearchCurrentFolder,
+}
+
 /// An open right-click context menu: where it sits, and the entry it targets
 /// (None when invoked on empty space).
 struct ContextMenu {
@@ -2580,6 +2569,7 @@ struct Shuffle {
     // Command palette (Cmd+P).
     focus: FocusHandle,
     palette_open: bool,
+    palette_mode: PaletteMode,
     query: String,
     /// Text-cursor position in `query`, as a char index (0..=char count).
     query_cursor: usize,
@@ -2808,6 +2798,7 @@ impl Shuffle {
             scroll_drag: None,
             focus: cx.focus_handle(),
             palette_open: false,
+            palette_mode: PaletteMode::Commands,
             query: String::new(),
             query_cursor: 0,
             query_anchor: None,
@@ -4791,18 +4782,43 @@ impl Shuffle {
 
     // ----- command palette (Cmd+P) -----
 
-    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette_open = !self.palette_open;
-        if self.palette_open {
-            self.query.clear();
-            self.query_cursor = 0;
-            self.query_anchor = None;
-            self.palette_hist_pos = None;
-            self.selected = 0;
-            self.refresh_palette(cx);
-            window.focus(&self.focus);
-        }
+    fn open_palette(
+        &mut self,
+        mode: PaletteMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.palette_open = true;
+        self.palette_mode = mode;
+        self.term_focused = false;
+        let pane = self.active_pane;
+        let tab = self.tab_mut(pane);
+        tab.find_query = None;
+        tab.find_results.clear();
+        self.query.clear();
+        self.query_cursor = 0;
+        self.query_anchor = None;
+        self.palette_hist_pos = None;
+        self.selected = 0;
+        self.refresh_palette(cx);
+        window.focus(&self.focus);
         cx.notify();
+    }
+
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open && self.palette_mode == PaletteMode::Commands {
+            self.close_palette(cx);
+        } else {
+            self.open_palette(PaletteMode::Commands, window, cx);
+        }
+    }
+
+    fn toggle_current_folder_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_open && self.palette_mode == PaletteMode::SearchCurrentFolder {
+            self.close_palette(cx);
+        } else {
+            self.open_palette(PaletteMode::SearchCurrentFolder, window, cx);
+        }
     }
 
     fn close_palette(&mut self, cx: &mut Context<Self>) {
@@ -4830,6 +4846,47 @@ impl Shuffle {
         self.palette_actions = None;
         self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
         let q = self.query.trim().to_string();
+
+        if self.palette_mode == PaletteMode::SearchCurrentFolder {
+            if q.is_empty() {
+                self.palette_items.clear();
+                cx.notify();
+                return;
+            }
+            let dir = self.active_tab().current_dir.clone();
+            let entries = &self.active_tab().entries;
+            let mut scored: Vec<(i32, usize)> = entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, entry)| find_score(&q, &entry.name).map(|score| (score, i)))
+                .collect();
+            scored.sort_unstable_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| entries[b.1].is_dir.cmp(&entries[a.1].is_dir))
+                    .then_with(|| {
+                        entries[a.1]
+                            .name
+                            .to_lowercase()
+                            .cmp(&entries[b.1].name.to_lowercase())
+                    })
+            });
+            self.palette_items = scored
+                .into_iter()
+                .take(50)
+                .map(|(_, i)| {
+                    let entry = &entries[i];
+                    let path = dir.join(&entry.name);
+                    PaletteItem {
+                        title: entry.name.clone(),
+                        subtitle: path.to_string_lossy().into_owned(),
+                        action: Action::Open(path, entry.is_dir),
+                        is_dir: entry.is_dir,
+                    }
+                })
+                .collect();
+            cx.notify();
+            return;
+        }
 
         if q.is_empty() {
             self.palette_items = self.default_commands();
@@ -5091,7 +5148,7 @@ impl Shuffle {
                 let a = self.panes[pane].active;
                 self.close_tab(pane, a, cx);
             }
-            KeyAction::Find => self.open_find(pane, cx),
+            KeyAction::Find => self.toggle_current_folder_search(window, cx),
             KeyAction::SelectAll => {
                 let all: HashSet<PathBuf> = self.display_paths(pane).into_iter().collect();
                 self.tab_mut(pane).selection = all;
@@ -5609,10 +5666,14 @@ impl Shuffle {
         // Input line: query with a caret, or a dim placeholder. A selection
         // (whole via Cmd+A, or a word range via Option+Shift+Arrow) is drawn as
         // a highlighted span between the unselected head and tail.
+        let placeholder = match self.palette_mode {
+            PaletteMode::Commands => "Type a path, or a file/folder name…",
+            PaletteMode::SearchCurrentFolder => "Search the current folder…",
+        };
         let input = if self.query.is_empty() {
             div()
                 .text_color(rgb(t.text_dim))
-                .child("Type a path, or a file/folder name…")
+                .child(placeholder)
         } else if let Some((lo, hi)) = self.query_sel() {
             let (bl, bh) = (self.query_byte(lo), self.query_byte(hi));
             div()
@@ -5665,7 +5726,16 @@ impl Shuffle {
                     .py_2()
                     .border_b_1()
                     .border_color(rgb(t.border_strong))
-                    .child(div().flex_none().text_color(rgb(t.accent)).child("›"))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(t.accent))
+                            .child(if self.palette_mode == PaletteMode::Commands {
+                                "›"
+                            } else {
+                                "🔍"
+                            }),
+                    )
                     .child(input),
             )
             // Scrollable, height-capped results with a scroll indicator.
@@ -6147,17 +6217,6 @@ impl Shuffle {
     }
 
     // ----- in-directory find (the "/" filter) -----
-
-    /// Open the find bar for a pane, filtering only its current directory.
-    fn open_find(&mut self, pane: usize, cx: &mut Context<Self>) {
-        self.active_pane = pane;
-        let tab = self.tab_mut(pane);
-        tab.find_query = Some(String::new());
-        tab.find_cursor = 0;
-        tab.find_anchor = None;
-        self.recompute_find(pane);
-        cx.notify();
-    }
 
     /// The find query's selected range (char indices), if any.
     fn find_sel(&self, pane: usize) -> Option<(usize, usize)> {
@@ -7693,41 +7752,12 @@ impl Shuffle {
             )
     }
 
-    /// Bottom-right filter affordance for a pane. When a find is active it shows
-    /// the live editable box; otherwise it shows a compact, clickable "Filter"
-    /// pill so mouse users can start filtering without pressing "/".
-    fn render_filter_box(&self, pane: usize, cx: &Context<Self>) -> AnyElement {
-        let t = theme();
+    /// Legacy in-list filter display. New searches open from the top toolbar;
+    /// this remains only to finish any filter state created before that switch.
+    fn render_filter_box(&self, pane: usize, _cx: &Context<Self>) -> AnyElement {
         match self.tab(pane).find_query.clone() {
             Some(q) => self.render_find_box(pane, &q).into_any_element(),
-            // The always-on pill can be hidden in Settings; "/" still opens it.
-            None if !prefs().show_filter_button => gpui::Empty.into_any_element(),
-            None => div()
-                .id(("filter-pill", pane))
-                .absolute()
-                .bottom(px(16.0))
-                .right(px(16.0))
-                .flex()
-                .items_center()
-                .gap_1()
-                .px_3()
-                .py_1()
-                .rounded_lg()
-                .cursor_pointer()
-                .bg(Theme::alpha(t.surface, 0xe6))
-                .border_1()
-                .border_color(rgb(t.border_strong))
-                .shadow_lg()
-                .text_color(rgb(t.text_muted))
-                .hover(|s| s.text_color(rgb(t.text)).border_color(rgb(t.accent)))
-                .child(div().flex_none().text_xs().child("🔍"))
-                .child(div().flex_none().child("Filter"))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.active_pane = pane;
-                    this.open_find(pane, cx);
-                    window.focus(&this.focus);
-                }))
-                .into_any_element(),
+            None => gpui::Empty.into_any_element(),
         }
     }
 
@@ -8359,8 +8389,7 @@ impl Shuffle {
                     this.set_view(pane, mode, cx);
                 }))
         };
-        // Magnifier that opens the command palette (Cmd+P) — a mouse-reachable
-        // entry point sitting alongside the view-mode icons.
+        // Magnifier for a focused search of the active pane's current folder.
         let search_btn = div()
             .id(("palette-search", pane))
             .flex_none()
@@ -8376,9 +8405,7 @@ impl Shuffle {
             .child("🔍")
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.active_pane = pane;
-                if !this.palette_open {
-                    this.toggle_palette(window, cx);
-                }
+                this.toggle_current_folder_search(window, cx);
             }));
         div()
             .flex_none()
@@ -12532,8 +12559,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_fps={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_fps
         );
         let _ = fs::write(&file, body);
     }
@@ -12669,7 +12696,6 @@ fn load_prefs() -> Prefs {
                     }
                     "palette_history" => p.palette_history = on,
                     "groups_enabled" => p.groups_enabled = on,
-                    "show_filter_button" => p.show_filter_button = on,
                     "show_fps" => p.show_fps = on,
                     _ => {}
                 }
