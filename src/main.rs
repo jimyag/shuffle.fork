@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,11 +23,12 @@ use chrono::{DateTime, Local};
 use dispatch2::DispatchQueue;
 use gpui::{
     actions, anchored, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size,
-    uniform_list, Animation, AnimationExt, AnyElement, App,
-    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, ImageSource,
-    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
-    PathPromptOptions, Rgba,
-    RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
+    uniform_list, Animation, AnimationExt, AnyElement, App, Application, Bounds, ClickEvent,
+    ClipboardItem, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, ExternalPaths, FocusHandle, GlobalElementId, ImageSource, KeyBinding,
+    KeyDownEvent, LayoutId, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
+    PathPromptOptions, Pixels, Point, Rgba, RenderImage, ScrollHandle, ScrollStrategy,
+    ScrollWheelEvent, SharedString, Style, TextRun, TitlebarOptions, UTF16Selection,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use objc2::runtime::NSObjectProtocol;
@@ -905,6 +907,24 @@ fn next_word_boundary(s: &str, cursor: usize) -> usize {
 /// Byte offset of char index `i` in `s` (or `s.len()` if past the end).
 fn char_byte(s: &str, i: usize) -> usize {
     s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Convert a UTF-16 offset from the platform text system into a UTF-8 byte
+/// offset, clamping to the end of the string.
+fn byte_from_utf16(s: &str, offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (byte, ch) in s.char_indices() {
+        if utf16 >= offset {
+            return byte;
+        }
+        utf16 += ch.len_utf16();
+    }
+    s.len()
+}
+
+/// Convert a UTF-8 byte offset into the UTF-16 units expected by macOS.
+fn byte_to_utf16(s: &str, offset: usize) -> usize {
+    s[..offset.min(s.len())].encode_utf16().count()
 }
 
 /// Canonical string for a keystroke, e.g. "cmd-shift-p" or "/".
@@ -2588,6 +2608,8 @@ struct Shuffle {
     /// the range between them is selected; Cmd+A selects all, Option+Shift+Arrow
     /// extends by word. `None` means no selection.
     query_anchor: Option<usize>,
+    /// UTF-8 byte range currently owned by the platform input method.
+    query_marked_range: Option<Range<usize>>,
     /// Past palette queries (newest last), when the history setting is on.
     palette_hist: Vec<String>,
     /// Which history entry is being browsed with Up/Down (None = live query).
@@ -2819,6 +2841,7 @@ impl Shuffle {
             query: String::new(),
             query_cursor: 0,
             query_anchor: None,
+            query_marked_range: None,
             palette_hist: read_string_list("palette_history.txt"),
             palette_hist_pos: None,
             palette_items: Vec::new(),
@@ -5218,6 +5241,7 @@ impl Shuffle {
         self.query.clear();
         self.query_cursor = 0;
         self.query_anchor = None;
+        self.query_marked_range = None;
         self.palette_hist_pos = None;
         self.selected = 0;
         self.refresh_palette(cx);
@@ -5276,6 +5300,7 @@ impl Shuffle {
     fn close_palette(&mut self, cx: &mut Context<Self>) {
         self.palette_open = false;
         self.palette_actions = None;
+        self.query_marked_range = None;
         cx.notify();
     }
 
@@ -5981,12 +6006,9 @@ impl Shuffle {
                 if cmd {
                     return; // ignore other Cmd-combos
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
-                        self.palette_insert(ch);
-                        self.refresh_palette(cx);
-                    }
-                }
+                // Printable text is delivered through EntityInputHandler. That
+                // path is required for IME composition and candidate selection;
+                // inserting key_char here would also duplicate Latin input.
             }
         }
     }
@@ -6069,6 +6091,7 @@ impl Shuffle {
 
     /// Insert `s` at the cursor (replacing the selection first, if any).
     fn palette_insert(&mut self, s: &str) {
+        self.query_marked_range = None;
         self.query_delete_sel();
         let b = self.query_byte(self.query_cursor);
         self.query.insert_str(b, s);
@@ -6078,6 +6101,7 @@ impl Shuffle {
 
     /// Delete the char before the cursor (or the whole selection).
     fn palette_backspace(&mut self) {
+        self.query_marked_range = None;
         if self.query_delete_sel() {
             return;
         }
@@ -6092,6 +6116,7 @@ impl Shuffle {
 
     /// Ctrl+U: delete everything before the cursor, keeping what's after.
     fn palette_kill_before(&mut self) {
+        self.query_marked_range = None;
         let b = self.query_byte(self.query_cursor);
         self.query.replace_range(0..b, "");
         self.query_cursor = 0;
@@ -6352,7 +6377,22 @@ impl Shuffle {
                                 "🔍"
                             }),
                     )
-                    .child(div().flex_1().min_w_0().child(input))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .child(input)
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .child(PaletteInputElement { input: cx.entity() }),
+                            ),
+                    )
                     .child(scope_switcher),
             )
             // Scrollable, height-capped results with a scroll indicator.
@@ -9818,6 +9858,258 @@ fn header_cell(
                     }),
                 ),
         )
+}
+
+impl Shuffle {
+    fn palette_selection_bytes(&self) -> (Range<usize>, bool) {
+        let cursor = self.query_cursor.min(self.query.chars().count());
+        match self.query_anchor.filter(|anchor| *anchor != cursor) {
+            Some(anchor) => {
+                let (start, end) = if anchor < cursor {
+                    (anchor, cursor)
+                } else {
+                    (cursor, anchor)
+                };
+                (
+                    self.query_byte(start)..self.query_byte(end),
+                    anchor > cursor,
+                )
+            }
+            None => {
+                let byte = self.query_byte(cursor);
+                (byte..byte, false)
+            }
+        }
+    }
+
+    fn palette_replace_range(&self, range_utf16: Option<&Range<usize>>) -> Range<usize> {
+        range_utf16
+            .map(|range| {
+                byte_from_utf16(&self.query, range.start)
+                    ..byte_from_utf16(&self.query, range.end)
+            })
+            .or_else(|| self.query_marked_range.clone())
+            .unwrap_or_else(|| self.palette_selection_bytes().0)
+    }
+
+    fn set_palette_selection_bytes(&mut self, range: Range<usize>) {
+        let start = self.query[..range.start].chars().count();
+        let end = self.query[..range.end].chars().count();
+        self.query_cursor = end;
+        self.query_anchor = (start != end).then_some(start);
+    }
+}
+
+impl EntityInputHandler for Shuffle {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if !self.palette_open {
+            return None;
+        }
+        let range = byte_from_utf16(&self.query, range_utf16.start)
+            ..byte_from_utf16(&self.query, range_utf16.end);
+        actual_range.replace(
+            byte_to_utf16(&self.query, range.start)..byte_to_utf16(&self.query, range.end),
+        );
+        Some(self.query[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        if !self.palette_open {
+            return None;
+        }
+        let (range, reversed) = self.palette_selection_bytes();
+        Some(UTF16Selection {
+            range: byte_to_utf16(&self.query, range.start)
+                ..byte_to_utf16(&self.query, range.end),
+            reversed,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.palette_open.then(|| {
+            self.query_marked_range.as_ref().map(|range| {
+                byte_to_utf16(&self.query, range.start)
+                    ..byte_to_utf16(&self.query, range.end)
+            })
+        })?
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.query_marked_range = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.palette_open {
+            return;
+        }
+        let range = self.palette_replace_range(range_utf16.as_ref());
+        let cursor = range.start + text.len();
+        self.query.replace_range(range, text);
+        self.set_palette_selection_bytes(cursor..cursor);
+        self.query_marked_range = None;
+        self.palette_hist_pos = None;
+        self.refresh_palette(cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.palette_open {
+            return;
+        }
+        let range = self.palette_replace_range(range_utf16.as_ref());
+        let start = range.start;
+        self.query.replace_range(range, new_text);
+        self.query_marked_range = (!new_text.is_empty()).then_some(start..start + new_text.len());
+
+        let selected = new_selected_range_utf16
+            .map(|range| {
+                start + byte_from_utf16(new_text, range.start)
+                    ..start + byte_from_utf16(new_text, range.end)
+            })
+            .unwrap_or(start + new_text.len()..start + new_text.len());
+        self.set_palette_selection_bytes(selected);
+        self.palette_hist_pos = None;
+        self.refresh_palette(cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        if !self.palette_open {
+            return None;
+        }
+        let style = window.text_style();
+        let text: SharedString = self.query.clone().into();
+        let run = TextRun {
+            len: text.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(text, font_size, &[run], None);
+        let start = byte_from_utf16(&self.query, range_utf16.start);
+        let end = byte_from_utf16(&self.query, range_utf16.end);
+        let left = element_bounds.left() + line.x_for_index(start);
+        let right = element_bounds.left() + line.x_for_index(end).max(px(1.0));
+        Some(Bounds::from_corners(
+            point(left, element_bounds.top()),
+            point(right.max(left + px(1.0)), element_bounds.bottom()),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let cursor = self.query_byte(self.query_cursor.min(self.query.chars().count()));
+        Some(byte_to_utf16(&self.query, cursor))
+    }
+}
+
+struct PaletteInputElement {
+    input: Entity<Shuffle>,
+}
+
+impl IntoElement for PaletteInputElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for PaletteInputElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = relative(1.0).into();
+        style.size.height = relative(1.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus = self.input.read(cx).focus.clone();
+        window.handle_input(
+            &focus,
+            ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
+    }
 }
 
 impl Render for Shuffle {
