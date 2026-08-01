@@ -12082,6 +12082,11 @@ fn format_size(is_dir: bool, size: u64) -> String {
     }
 }
 
+/// Finder metadata is implementation detail, not a user file.
+fn should_hide_file(name: &str) -> bool {
+    name == ".DS_Store"
+}
+
 /// Read a directory's entries with full metadata (one `stat` per entry), sorted
 /// directories-first then case-insensitive by name. This is the slow path; the
 /// UI shows `read_entries_fast` first and swaps this in from the background.
@@ -12090,6 +12095,9 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
     if let Ok(read_dir) = fs::read_dir(dir) {
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if should_hide_file(&name) {
+                continue;
+            }
             // One stat, following symlinks: gives is_dir, size, and mtime.
             let md = fs::metadata(entry.path()).ok();
             let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
@@ -12118,6 +12126,9 @@ fn read_entries_fast(dir: &Path) -> Vec<Entry> {
     if let Ok(read_dir) = fs::read_dir(dir) {
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if should_hide_file(&name) {
+                continue;
+            }
             let is_dir = match entry.file_type() {
                 Ok(t) if t.is_dir() => true,
                 // Resolving a symlink needs a stat, but symlinks are rare.
@@ -12222,6 +12233,9 @@ fn list_dir_names(dir: &Path) -> Vec<(String, bool)> {
     if let Ok(read_dir) = fs::read_dir(dir) {
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if should_hide_file(&name) {
+                continue;
+            }
             let is_dir = match entry.file_type() {
                 Ok(t) if t.is_dir() => true,
                 Ok(t) if t.is_symlink() => entry.path().is_dir(),
@@ -12665,6 +12679,9 @@ fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
+        if should_hide_file(&name) {
+            continue;
+        }
         if let Some(score) = score_entry(&q, &q_str, &name, &path, false) {
             scored.push((score, name, path));
         }
