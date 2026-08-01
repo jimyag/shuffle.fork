@@ -10,8 +10,9 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11734,6 +11735,15 @@ fn toggle_quick_look_panel(paths: Vec<PathBuf>, focused: Option<&Path>) {
     if paths.is_empty() {
         return;
     }
+    // Quick Look does not consistently preview developer-oriented text types
+    // such as YAML and .conf files. For the selected file only, hand it a
+    // bounded private .txt copy; all natively-supported files stay untouched.
+    if let Some(path) = focused {
+        if let Some(preview) = text_quick_look_fallback(path) {
+            show_quick_look_items(vec![preview], 0);
+            return;
+        }
+    }
     let current = focused
         .and_then(|path| paths.iter().position(|candidate| candidate == path))
         .unwrap_or(0);
@@ -11741,6 +11751,88 @@ fn toggle_quick_look_panel(paths: Vec<PathBuf>, focused: Option<&Path>) {
         .iter()
         .filter_map(|path| PreviewItem::from_file_url(path, None))
         .collect();
+    show_quick_look_items(items, current);
+}
+
+const TEXT_PREVIEW_MAX_BYTES: u64 = 1024 * 1024;
+
+fn text_quick_look_fallback(path: &Path) -> Option<PreviewItem> {
+    if !is_quick_look_text_type(path) {
+        return None;
+    }
+
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(TEXT_PREVIEW_MAX_BYTES + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+
+    let truncated = bytes.len() as u64 > TEXT_PREVIEW_MAX_BYTES;
+    bytes.truncate(TEXT_PREVIEW_MAX_BYTES as usize);
+    if let Err(error) = std::str::from_utf8(&bytes) {
+        // Only tolerate an incomplete UTF-8 character cut by the size limit.
+        if !truncated || error.error_len().is_some() {
+            return None;
+        }
+        bytes.truncate(error.valid_up_to());
+    }
+    if truncated {
+        bytes.extend_from_slice(b"\n\n--- Preview truncated at 1 MiB ---\n");
+    }
+
+    let dir = std::env::temp_dir().join(format!("shuffle-text-preview-{}", std::process::id()));
+    fs::create_dir_all(&dir).ok()?;
+    let name = path.file_name()?.to_string_lossy();
+    let preview_path = dir.join(format!("{name}.txt"));
+    let mut preview = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&preview_path)
+        .ok()?;
+    preview.write_all(&bytes).ok()?;
+    PreviewItem::from_file_url(preview_path, None)
+}
+
+fn is_quick_look_text_type(path: &Path) -> bool {
+    // Extensionless files (including dotfiles such as `.aicommit2`) may still
+    // be text. The caller validates their contents before creating a preview.
+    if path.extension().is_none() {
+        return true;
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    if matches!(
+        extension.as_deref(),
+        Some(
+            "yaml" | "yml" | "conf" | "config" | "cfg" | "ini" | "env" | "properties"
+                | "toml" | "json" | "json5" | "jsonl" | "lock" | "log" | "md"
+                | "markdown" | "rst" | "csv" | "tsv" | "xml" | "plist" | "sql" | "graphql"
+                | "gql" | "proto" | "diff" | "patch" | "rs" | "go" | "py" | "rb" | "php"
+                | "js" | "jsx" | "ts" | "tsx" | "vue" | "svelte" | "sh" | "bash" | "zsh"
+                | "fish" | "ps1" | "c" | "h" | "cc" | "cpp" | "hpp" | "m" | "mm" | "java"
+                | "kt" | "kts" | "swift" | "scala" | "css" | "scss" | "sass" | "less"
+                | "html" | "htm"
+        )
+    ) {
+        return true;
+    }
+
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            "Dockerfile" | "Containerfile" | "Makefile" | "Gemfile" | "Rakefile"
+                | "CMakeLists.txt" | ".gitignore" | ".gitattributes" | ".editorconfig"
+        )
+    )
+}
+
+fn show_quick_look_items(items: Vec<PreviewItem>, current: usize) {
     if items.is_empty() {
         return;
     }
